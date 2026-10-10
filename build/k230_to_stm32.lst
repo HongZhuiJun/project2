@@ -1,0 +1,2038 @@
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 1
+
+
+   1              		.cpu cortex-m3
+   2              		.arch armv7-m
+   3              		.fpu softvfp
+   4              		.eabi_attribute 20, 1
+   5              		.eabi_attribute 21, 1
+   6              		.eabi_attribute 23, 3
+   7              		.eabi_attribute 24, 1
+   8              		.eabi_attribute 25, 1
+   9              		.eabi_attribute 26, 1
+  10              		.eabi_attribute 30, 1
+  11              		.eabi_attribute 34, 1
+  12              		.eabi_attribute 18, 4
+  13              		.file	"k230_to_stm32.c"
+  14              		.text
+  15              	.Ltext0:
+  16              		.cfi_sections	.debug_frame
+  17              		.file 1 "modules/k230_to_stm32.c"
+  18              		.section	.text.K230ToStm32ReadInt16BE,"ax",%progbits
+  19              		.align	1
+  20              		.syntax unified
+  21              		.thumb
+  22              		.thumb_func
+  24              	K230ToStm32ReadInt16BE:
+  25              	.LVL0:
+  26              	.LFB65:
+   1:modules/k230_to_stm32.c **** /**
+   2:modules/k230_to_stm32.c ****  * @file k230_to_stm32.c
+   3:modules/k230_to_stm32.c ****  * @brief Module 层：K230 视觉帧接收、校验与解析（人体中心坐标）。
+   4:modules/k230_to_stm32.c ****  *
+   5:modules/k230_to_stm32.c ****  * 解析器沿用逐字节状态机的写法：帧头匹配 → 收满载荷 → 校验 → 更新
+   6:modules/k230_to_stm32.c ****  * 状态机天然抗错位（失配后能重新同步），且一次回调收到多帧或半帧都
+   7:modules/k230_to_stm32.c ****  *
+   8:modules/k230_to_stm32.c ****  * 并发说明（开发规范 §8.3）：
+   9:modules/k230_to_stm32.c ****  *   - 解析状态机（parse_index / frame_buf）只被接收中断访问，
+  10:modules/k230_to_stm32.c ****  *     主循环不读，因此不需要保护。
+  11:modules/k230_to_stm32.c ****  *   - 数据快照 data 由接收中断写、主循环读，属于单写多读，
+  12:modules/k230_to_stm32.c ****  *     读取侧用临界区保护（见 K230ToStm32GetData）。
+  13:modules/k230_to_stm32.c ****  */
+  14:modules/k230_to_stm32.c **** #include "k230_to_stm32.h"
+  15:modules/k230_to_stm32.c **** #include <string.h>
+  16:modules/k230_to_stm32.c **** 
+  17:modules/k230_to_stm32.c **** /* 帧头字节表，供状态机逐字节比对 */
+  18:modules/k230_to_stm32.c **** static const uint8_t k230_frame_header[K230_FRAME_HEADER_LEN] = {
+  19:modules/k230_to_stm32.c ****     K230_FRAME_HEADER_0,
+  20:modules/k230_to_stm32.c ****     K230_FRAME_HEADER_1,
+  21:modules/k230_to_stm32.c ****     K230_FRAME_HEADER_2,
+  22:modules/k230_to_stm32.c ****     K230_FRAME_HEADER_3,
+  23:modules/k230_to_stm32.c **** };
+  24:modules/k230_to_stm32.c **** 
+  25:modules/k230_to_stm32.c **** struct K230ToStm32Instance {
+  26:modules/k230_to_stm32.c ****     K230UsartInstance *usart_instance;
+  27:modules/k230_to_stm32.c **** 
+  28:modules/k230_to_stm32.c ****     /* 解析状态机：仅接收中断访问 */
+  29:modules/k230_to_stm32.c ****     uint8_t parse_index;                   /* 已匹配/已接收的字节数，0 表示等待帧�
+  30:modules/k230_to_stm32.c ****     uint8_t frame_buf[K230_FRAME_LEN];     /* 整帧暂存 */
+  31:modules/k230_to_stm32.c ****     uint8_t rx_buf[K230_RX_BUF_SIZE];      /* BSP 层接收缓冲，由本实例持有 */
+  32:modules/k230_to_stm32.c **** 
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 2
+
+
+  33:modules/k230_to_stm32.c ****     /* 数据快照：中断写，主循环读 */
+  34:modules/k230_to_stm32.c ****     volatile K230_Data_s data;
+  35:modules/k230_to_stm32.c **** 
+  36:modules/k230_to_stm32.c ****     /* 统计量：仅接收中断写，主循环读单字是原子的 */
+  37:modules/k230_to_stm32.c ****     volatile uint32_t frame_count;
+  38:modules/k230_to_stm32.c ****     volatile uint32_t checksum_error_count;
+  39:modules/k230_to_stm32.c ****     volatile uint32_t lost_frame_count;
+  40:modules/k230_to_stm32.c **** };
+  41:modules/k230_to_stm32.c **** 
+  42:modules/k230_to_stm32.c **** /* 实例池：静态分配，控制周期内不做动态内存（开发规范 §7.3） */
+  43:modules/k230_to_stm32.c **** static K230ToStm32Instance k230_to_stm32_pool[K230_TO_STM32_MAX_INSTANCE];
+  44:modules/k230_to_stm32.c **** 
+  45:modules/k230_to_stm32.c **** /* k230_to_stm32_Init() 成功注册的实例。调用方（main）不再持有这个指针，
+  46:modules/k230_to_stm32.c ****    后续取数据 / 查在线状态的接口要拿它，所以在这里留一份 */
+  47:modules/k230_to_stm32.c **** static K230ToStm32Instance *k230_to_stm32_instance = NULL;
+  48:modules/k230_to_stm32.c **** 
+  49:modules/k230_to_stm32.c **** /* ============================ 内部函数 ============================ */
+  50:modules/k230_to_stm32.c **** 
+  51:modules/k230_to_stm32.c **** /**
+  52:modules/k230_to_stm32.c ****  * @brief 从字节流读取 int16（大端序）。
+  53:modules/k230_to_stm32.c ****  */
+  54:modules/k230_to_stm32.c **** static int16_t K230ToStm32ReadInt16BE(const uint8_t *data)
+  55:modules/k230_to_stm32.c **** {
+  27              		.loc 1 55 1 view -0
+  28              		.cfi_startproc
+  29              		@ args = 0, pretend = 0, frame = 0
+  30              		@ frame_needed = 0, uses_anonymous_args = 0
+  31              		@ link register save eliminated.
+  56:modules/k230_to_stm32.c ****     return (int16_t)(((uint16_t)data[0] << 8) | (uint16_t)data[1]);
+  32              		.loc 1 56 5 view .LVU1
+  33              		.loc 1 56 37 is_stmt 0 view .LVU2
+  34 0000 0378     		ldrb	r3, [r0]	@ zero_extendqisi2
+  35              		.loc 1 56 63 view .LVU3
+  36 0002 4078     		ldrb	r0, [r0, #1]	@ zero_extendqisi2
+  37              	.LVL1:
+  38              		.loc 1 56 12 view .LVU4
+  39 0004 40EA0320 		orr	r0, r0, r3, lsl #8
+  57:modules/k230_to_stm32.c **** }
+  40              		.loc 1 57 1 view .LVU5
+  41 0008 00B2     		sxth	r0, r0
+  42 000a 7047     		bx	lr
+  43              		.cfi_endproc
+  44              	.LFE65:
+  46              		.section	.text.K230ToStm32IsCoordValid,"ax",%progbits
+  47              		.align	1
+  48              		.syntax unified
+  49              		.thumb
+  50              		.thumb_func
+  52              	K230ToStm32IsCoordValid:
+  53              	.LVL2:
+  54              	.LFB66:
+  58:modules/k230_to_stm32.c **** 
+  59:modules/k230_to_stm32.c **** /**
+  60:modules/k230_to_stm32.c ****  * @brief 判断像素坐标是否落在检测画面内。
+  61:modules/k230_to_stm32.c ****  *
+  62:modules/k230_to_stm32.c ****  * @param x_px 人体框中心像素 X。
+  63:modules/k230_to_stm32.c ****  * @param y_px 人体框中心像素 Y。
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 3
+
+
+  64:modules/k230_to_stm32.c ****  * @return 1 = 有效，0 = 无效（目标丢失或误检）。
+  65:modules/k230_to_stm32.c ****  *
+  66:modules/k230_to_stm32.c ****  * @note 任何负值都按「未检测到」处理：协议用 -1 表示丢失，
+  67:modules/k230_to_stm32.c ****  *       即便上位机将来用别的负值表示其他异常，也不会被当成有效坐标
+  68:modules/k230_to_stm32.c ****  *       送进控制环。超出画面范围的坐标直接丢弃而不是限幅 ——
+  69:modules/k230_to_stm32.c ****  *       限幅会把误检变成一个「看起来合理」的坐标，控制环会去追它。
+  70:modules/k230_to_stm32.c ****  */
+  71:modules/k230_to_stm32.c **** static uint8_t K230ToStm32IsCoordValid(int16_t x_px, int16_t y_px)
+  72:modules/k230_to_stm32.c **** {
+  55              		.loc 1 72 1 is_stmt 1 view -0
+  56              		.cfi_startproc
+  57              		@ args = 0, pretend = 0, frame = 0
+  58              		@ frame_needed = 0, uses_anonymous_args = 0
+  59              		@ link register save eliminated.
+  73:modules/k230_to_stm32.c ****     if ((x_px < 0) || (y_px < 0)) {
+  60              		.loc 1 73 5 view .LVU7
+  61              		.loc 1 73 8 is_stmt 0 view .LVU8
+  62 0000 0028     		cmp	r0, #0
+  63              		.loc 1 73 8 view .LVU9
+  64 0002 09DB     		blt	.L4
+  65              		.loc 1 73 20 discriminator 1 view .LVU10
+  66 0004 0029     		cmp	r1, #0
+  67 0006 09DB     		blt	.L5
+  74:modules/k230_to_stm32.c ****         return 0u;
+  75:modules/k230_to_stm32.c ****     }
+  76:modules/k230_to_stm32.c **** 
+  77:modules/k230_to_stm32.c ****     if (((int32_t)x_px >= K230_IMAGE_WIDTH_PX) ||
+  68              		.loc 1 77 5 is_stmt 1 view .LVU11
+  69              		.loc 1 77 8 is_stmt 0 view .LVU12
+  70 0008 B0F5A06F 		cmp	r0, #1280
+  71 000c 08DA     		bge	.L6
+  72              		.loc 1 77 48 discriminator 1 view .LVU13
+  73 000e B1F5707F 		cmp	r1, #960
+  74 0012 07DA     		bge	.L7
+  78:modules/k230_to_stm32.c ****         ((int32_t)y_px >= K230_IMAGE_HEIGHT_PX)) {
+  79:modules/k230_to_stm32.c ****         return 0u;
+  80:modules/k230_to_stm32.c ****     }
+  81:modules/k230_to_stm32.c **** 
+  82:modules/k230_to_stm32.c ****     return 1u;
+  75              		.loc 1 82 12 view .LVU14
+  76 0014 0120     		movs	r0, #1
+  77              	.LVL3:
+  78              		.loc 1 82 12 view .LVU15
+  79 0016 7047     		bx	lr
+  80              	.L4:
+  74:modules/k230_to_stm32.c ****         return 0u;
+  81              		.loc 1 74 16 view .LVU16
+  82 0018 0020     		movs	r0, #0
+  83 001a 7047     		bx	lr
+  84              	.L5:
+  85 001c 0020     		movs	r0, #0
+  86 001e 7047     		bx	lr
+  87              	.L6:
+  79:modules/k230_to_stm32.c ****     }
+  88              		.loc 1 79 16 view .LVU17
+  89 0020 0020     		movs	r0, #0
+  90 0022 7047     		bx	lr
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 4
+
+
+  91              	.L7:
+  92 0024 0020     		movs	r0, #0
+  83:modules/k230_to_stm32.c **** }
+  93              		.loc 1 83 1 view .LVU18
+  94 0026 7047     		bx	lr
+  95              		.cfi_endproc
+  96              	.LFE66:
+  98              		.section	.text.K230ToStm32HandleFrame,"ax",%progbits
+  99              		.align	1
+ 100              		.syntax unified
+ 101              		.thumb
+ 102              		.thumb_func
+ 104              	K230ToStm32HandleFrame:
+ 105              	.LVL4:
+ 106              	.LFB67:
+  84:modules/k230_to_stm32.c **** 
+  85:modules/k230_to_stm32.c **** /**
+  86:modules/k230_to_stm32.c ****  * @brief 校验并处理一整帧。
+  87:modules/k230_to_stm32.c ****  *
+  88:modules/k230_to_stm32.c ****  * @note 在接收中断中执行，必须保持短小（开发规范 §8.1）。
+  89:modules/k230_to_stm32.c ****  */
+  90:modules/k230_to_stm32.c **** static void K230ToStm32HandleFrame(K230ToStm32Instance *instance)
+  91:modules/k230_to_stm32.c **** {
+ 107              		.loc 1 91 1 is_stmt 1 view -0
+ 108              		.cfi_startproc
+ 109              		@ args = 0, pretend = 0, frame = 0
+ 110              		@ frame_needed = 0, uses_anonymous_args = 0
+ 111              		.loc 1 91 1 is_stmt 0 view .LVU20
+ 112 0000 70B5     		push	{r4, r5, r6, lr}
+ 113              	.LCFI0:
+ 114              		.cfi_def_cfa_offset 16
+ 115              		.cfi_offset 4, -16
+ 116              		.cfi_offset 5, -12
+ 117              		.cfi_offset 6, -8
+ 118              		.cfi_offset 14, -4
+ 119 0002 0446     		mov	r4, r0
+  92:modules/k230_to_stm32.c ****     /* 校验：前 12 字节逐字节异或 */
+  93:modules/k230_to_stm32.c ****     uint8_t checksum = 0u;
+ 120              		.loc 1 93 5 is_stmt 1 view .LVU21
+ 121              	.LVL5:
+  94:modules/k230_to_stm32.c ****     for (uint8_t i = 0u; i < K230_FRAME_CHECKSUM_INDEX; i++) {
+ 122              		.loc 1 94 5 view .LVU22
+ 123              	.LBB8:
+ 124              		.loc 1 94 10 view .LVU23
+ 125              		.loc 1 94 18 is_stmt 0 view .LVU24
+ 126 0004 0023     		movs	r3, #0
+ 127              	.LBE8:
+  93:modules/k230_to_stm32.c ****     for (uint8_t i = 0u; i < K230_FRAME_CHECKSUM_INDEX; i++) {
+ 128              		.loc 1 93 13 view .LVU25
+ 129 0006 1A46     		mov	r2, r3
+ 130              	.LBB9:
+ 131              		.loc 1 94 5 view .LVU26
+ 132 0008 04E0     		b	.L9
+ 133              	.LVL6:
+ 134              	.L10:
+  95:modules/k230_to_stm32.c ****         checksum ^= instance->frame_buf[i];
+ 135              		.loc 1 95 9 is_stmt 1 view .LVU27
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 5
+
+
+ 136              		.loc 1 95 40 is_stmt 0 view .LVU28
+ 137 000a E118     		adds	r1, r4, r3
+ 138 000c 4979     		ldrb	r1, [r1, #5]	@ zero_extendqisi2
+ 139              		.loc 1 95 18 view .LVU29
+ 140 000e 4A40     		eors	r2, r2, r1
+ 141              	.LVL7:
+  94:modules/k230_to_stm32.c ****     for (uint8_t i = 0u; i < K230_FRAME_CHECKSUM_INDEX; i++) {
+ 142              		.loc 1 94 58 is_stmt 1 discriminator 3 view .LVU30
+ 143 0010 0133     		adds	r3, r3, #1
+ 144              	.LVL8:
+  94:modules/k230_to_stm32.c ****     for (uint8_t i = 0u; i < K230_FRAME_CHECKSUM_INDEX; i++) {
+ 145              		.loc 1 94 58 is_stmt 0 discriminator 3 view .LVU31
+ 146 0012 DBB2     		uxtb	r3, r3
+ 147              	.LVL9:
+ 148              	.L9:
+  94:modules/k230_to_stm32.c ****     for (uint8_t i = 0u; i < K230_FRAME_CHECKSUM_INDEX; i++) {
+ 149              		.loc 1 94 28 is_stmt 1 discriminator 1 view .LVU32
+ 150 0014 0B2B     		cmp	r3, #11
+ 151 0016 F8D9     		bls	.L10
+ 152              	.LBE9:
+  96:modules/k230_to_stm32.c ****     }
+  97:modules/k230_to_stm32.c **** 
+  98:modules/k230_to_stm32.c ****     if (checksum != instance->frame_buf[K230_FRAME_CHECKSUM_INDEX]) {
+ 153              		.loc 1 98 5 view .LVU33
+ 154              		.loc 1 98 40 is_stmt 0 view .LVU34
+ 155 0018 637C     		ldrb	r3, [r4, #17]	@ zero_extendqisi2
+ 156              	.LVL10:
+ 157              		.loc 1 98 8 view .LVU35
+ 158 001a 9342     		cmp	r3, r2
+ 159 001c 05D0     		beq	.L11
+  99:modules/k230_to_stm32.c ****         /* 校验失败整帧丢弃。宁可少一帧数据，也不能把可疑数据交给控制�
+ 100:modules/k230_to_stm32.c ****         instance->checksum_error_count++;
+ 160              		.loc 1 100 9 is_stmt 1 view .LVU36
+ 161              		.loc 1 100 17 is_stmt 0 view .LVU37
+ 162 001e D4F8A830 		ldr	r3, [r4, #168]
+ 163              		.loc 1 100 39 view .LVU38
+ 164 0022 0133     		adds	r3, r3, #1
+ 165 0024 C4F8A830 		str	r3, [r4, #168]
+ 101:modules/k230_to_stm32.c ****         return;
+ 166              		.loc 1 101 9 is_stmt 1 view .LVU39
+ 167              	.LVL11:
+ 168              	.L8:
+ 102:modules/k230_to_stm32.c ****     }
+ 103:modules/k230_to_stm32.c **** 
+ 104:modules/k230_to_stm32.c ****     int16_t x_px = K230ToStm32ReadInt16BE(&instance->frame_buf[K230_FRAME_X_INDEX]);
+ 105:modules/k230_to_stm32.c ****     int16_t y_px = K230ToStm32ReadInt16BE(&instance->frame_buf[K230_FRAME_Y_INDEX]);
+ 106:modules/k230_to_stm32.c **** 
+ 107:modules/k230_to_stm32.c ****     instance->frame_count++;
+ 108:modules/k230_to_stm32.c ****     instance->data.x_px               = x_px;
+ 109:modules/k230_to_stm32.c ****     instance->data.y_px               = y_px;
+ 110:modules/k230_to_stm32.c ****     instance->data.last_frame_time_ms = HAL_GetTick();
+ 111:modules/k230_to_stm32.c **** 
+ 112:modules/k230_to_stm32.c ****     if (K230ToStm32IsCoordValid(x_px, y_px) != 0u) {
+ 113:modules/k230_to_stm32.c ****         instance->data.offset_x_px     = (int16_t)(x_px - (K230_IMAGE_WIDTH_PX / 2));
+ 114:modules/k230_to_stm32.c ****         instance->data.offset_y_px     = (int16_t)(y_px - (K230_IMAGE_HEIGHT_PX / 2));
+ 115:modules/k230_to_stm32.c ****         instance->data.target_detected = 1u;
+ 116:modules/k230_to_stm32.c ****         instance->data.data_valid      = 1u;
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 6
+
+
+ 117:modules/k230_to_stm32.c ****     } else {
+ 118:modules/k230_to_stm32.c ****         /* 目标丢失：必须清掉 data_valid。保留 offset_* 旧值只是为了联调时
+ 119:modules/k230_to_stm32.c ****            能看到人是在哪里丢的，上层一律以 data_valid 为准 */
+ 120:modules/k230_to_stm32.c ****         instance->data.target_detected = 0u;
+ 121:modules/k230_to_stm32.c ****         instance->data.data_valid      = 0u;
+ 122:modules/k230_to_stm32.c ****         instance->lost_frame_count++;
+ 123:modules/k230_to_stm32.c ****     }
+ 124:modules/k230_to_stm32.c **** }
+ 169              		.loc 1 124 1 is_stmt 0 view .LVU40
+ 170 0028 70BD     		pop	{r4, r5, r6, pc}
+ 171              	.LVL12:
+ 172              	.L11:
+ 104:modules/k230_to_stm32.c ****     int16_t y_px = K230ToStm32ReadInt16BE(&instance->frame_buf[K230_FRAME_Y_INDEX]);
+ 173              		.loc 1 104 5 is_stmt 1 view .LVU41
+ 104:modules/k230_to_stm32.c ****     int16_t y_px = K230ToStm32ReadInt16BE(&instance->frame_buf[K230_FRAME_Y_INDEX]);
+ 174              		.loc 1 104 20 is_stmt 0 view .LVU42
+ 175 002a 04F10900 		add	r0, r4, #9
+ 176              	.LVL13:
+ 104:modules/k230_to_stm32.c ****     int16_t y_px = K230ToStm32ReadInt16BE(&instance->frame_buf[K230_FRAME_Y_INDEX]);
+ 177              		.loc 1 104 20 view .LVU43
+ 178 002e FFF7FEFF 		bl	K230ToStm32ReadInt16BE
+ 179              	.LVL14:
+ 104:modules/k230_to_stm32.c ****     int16_t y_px = K230ToStm32ReadInt16BE(&instance->frame_buf[K230_FRAME_Y_INDEX]);
+ 180              		.loc 1 104 20 view .LVU44
+ 181 0032 0646     		mov	r6, r0
+ 182              	.LVL15:
+ 105:modules/k230_to_stm32.c **** 
+ 183              		.loc 1 105 5 is_stmt 1 view .LVU45
+ 105:modules/k230_to_stm32.c **** 
+ 184              		.loc 1 105 20 is_stmt 0 view .LVU46
+ 185 0034 04F10B00 		add	r0, r4, #11
+ 186 0038 FFF7FEFF 		bl	K230ToStm32ReadInt16BE
+ 187              	.LVL16:
+ 188 003c 0546     		mov	r5, r0
+ 189              	.LVL17:
+ 107:modules/k230_to_stm32.c ****     instance->data.x_px               = x_px;
+ 190              		.loc 1 107 5 is_stmt 1 view .LVU47
+ 107:modules/k230_to_stm32.c ****     instance->data.x_px               = x_px;
+ 191              		.loc 1 107 13 is_stmt 0 view .LVU48
+ 192 003e D4F8A430 		ldr	r3, [r4, #164]
+ 107:modules/k230_to_stm32.c ****     instance->data.x_px               = x_px;
+ 193              		.loc 1 107 26 view .LVU49
+ 194 0042 0133     		adds	r3, r3, #1
+ 195 0044 C4F8A430 		str	r3, [r4, #164]
+ 108:modules/k230_to_stm32.c ****     instance->data.y_px               = y_px;
+ 196              		.loc 1 108 5 is_stmt 1 view .LVU50
+ 108:modules/k230_to_stm32.c ****     instance->data.y_px               = y_px;
+ 197              		.loc 1 108 39 is_stmt 0 view .LVU51
+ 198 0048 A4F89460 		strh	r6, [r4, #148]	@ movhi
+ 109:modules/k230_to_stm32.c ****     instance->data.last_frame_time_ms = HAL_GetTick();
+ 199              		.loc 1 109 5 is_stmt 1 view .LVU52
+ 109:modules/k230_to_stm32.c ****     instance->data.last_frame_time_ms = HAL_GetTick();
+ 200              		.loc 1 109 39 is_stmt 0 view .LVU53
+ 201 004c A4F89600 		strh	r0, [r4, #150]	@ movhi
+ 110:modules/k230_to_stm32.c **** 
+ 202              		.loc 1 110 5 is_stmt 1 view .LVU54
+ 110:modules/k230_to_stm32.c **** 
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 7
+
+
+ 203              		.loc 1 110 41 is_stmt 0 view .LVU55
+ 204 0050 FFF7FEFF 		bl	HAL_GetTick
+ 205              	.LVL18:
+ 110:modules/k230_to_stm32.c **** 
+ 206              		.loc 1 110 39 discriminator 1 view .LVU56
+ 207 0054 C4F8A000 		str	r0, [r4, #160]
+ 112:modules/k230_to_stm32.c ****         instance->data.offset_x_px     = (int16_t)(x_px - (K230_IMAGE_WIDTH_PX / 2));
+ 208              		.loc 1 112 5 is_stmt 1 view .LVU57
+ 112:modules/k230_to_stm32.c ****         instance->data.offset_x_px     = (int16_t)(x_px - (K230_IMAGE_WIDTH_PX / 2));
+ 209              		.loc 1 112 9 is_stmt 0 view .LVU58
+ 210 0058 2946     		mov	r1, r5
+ 211 005a 3046     		mov	r0, r6
+ 212 005c FFF7FEFF 		bl	K230ToStm32IsCoordValid
+ 213              	.LVL19:
+ 112:modules/k230_to_stm32.c ****         instance->data.offset_x_px     = (int16_t)(x_px - (K230_IMAGE_WIDTH_PX / 2));
+ 214              		.loc 1 112 8 discriminator 1 view .LVU59
+ 215 0060 78B1     		cbz	r0, .L13
+ 113:modules/k230_to_stm32.c ****         instance->data.offset_y_px     = (int16_t)(y_px - (K230_IMAGE_HEIGHT_PX / 2));
+ 216              		.loc 1 113 9 is_stmt 1 view .LVU60
+ 113:modules/k230_to_stm32.c ****         instance->data.offset_y_px     = (int16_t)(y_px - (K230_IMAGE_HEIGHT_PX / 2));
+ 217              		.loc 1 113 57 is_stmt 0 view .LVU61
+ 218 0062 A6F52073 		sub	r3, r6, #640
+ 113:modules/k230_to_stm32.c ****         instance->data.offset_y_px     = (int16_t)(y_px - (K230_IMAGE_HEIGHT_PX / 2));
+ 219              		.loc 1 113 42 view .LVU62
+ 220 0066 1BB2     		sxth	r3, r3
+ 113:modules/k230_to_stm32.c ****         instance->data.offset_y_px     = (int16_t)(y_px - (K230_IMAGE_HEIGHT_PX / 2));
+ 221              		.loc 1 113 40 view .LVU63
+ 222 0068 A4F89830 		strh	r3, [r4, #152]	@ movhi
+ 114:modules/k230_to_stm32.c ****         instance->data.target_detected = 1u;
+ 223              		.loc 1 114 9 is_stmt 1 view .LVU64
+ 114:modules/k230_to_stm32.c ****         instance->data.target_detected = 1u;
+ 224              		.loc 1 114 57 is_stmt 0 view .LVU65
+ 225 006c A5F5F073 		sub	r3, r5, #480
+ 114:modules/k230_to_stm32.c ****         instance->data.target_detected = 1u;
+ 226              		.loc 1 114 42 view .LVU66
+ 227 0070 1BB2     		sxth	r3, r3
+ 114:modules/k230_to_stm32.c ****         instance->data.target_detected = 1u;
+ 228              		.loc 1 114 40 view .LVU67
+ 229 0072 A4F89A30 		strh	r3, [r4, #154]	@ movhi
+ 115:modules/k230_to_stm32.c ****         instance->data.data_valid      = 1u;
+ 230              		.loc 1 115 9 is_stmt 1 view .LVU68
+ 115:modules/k230_to_stm32.c ****         instance->data.data_valid      = 1u;
+ 231              		.loc 1 115 40 is_stmt 0 view .LVU69
+ 232 0076 0123     		movs	r3, #1
+ 233 0078 84F89C30 		strb	r3, [r4, #156]
+ 116:modules/k230_to_stm32.c ****     } else {
+ 234              		.loc 1 116 9 is_stmt 1 view .LVU70
+ 116:modules/k230_to_stm32.c ****     } else {
+ 235              		.loc 1 116 40 is_stmt 0 view .LVU71
+ 236 007c 84F89D30 		strb	r3, [r4, #157]
+ 237 0080 D2E7     		b	.L8
+ 238              	.L13:
+ 120:modules/k230_to_stm32.c ****         instance->data.data_valid      = 0u;
+ 239              		.loc 1 120 9 is_stmt 1 view .LVU72
+ 120:modules/k230_to_stm32.c ****         instance->data.data_valid      = 0u;
+ 240              		.loc 1 120 40 is_stmt 0 view .LVU73
+ 241 0082 0023     		movs	r3, #0
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 8
+
+
+ 242 0084 84F89C30 		strb	r3, [r4, #156]
+ 121:modules/k230_to_stm32.c ****         instance->lost_frame_count++;
+ 243              		.loc 1 121 9 is_stmt 1 view .LVU74
+ 121:modules/k230_to_stm32.c ****         instance->lost_frame_count++;
+ 244              		.loc 1 121 40 is_stmt 0 view .LVU75
+ 245 0088 84F89D30 		strb	r3, [r4, #157]
+ 122:modules/k230_to_stm32.c ****     }
+ 246              		.loc 1 122 9 is_stmt 1 view .LVU76
+ 122:modules/k230_to_stm32.c ****     }
+ 247              		.loc 1 122 17 is_stmt 0 view .LVU77
+ 248 008c D4F8AC30 		ldr	r3, [r4, #172]
+ 122:modules/k230_to_stm32.c ****     }
+ 249              		.loc 1 122 35 view .LVU78
+ 250 0090 0133     		adds	r3, r3, #1
+ 251 0092 C4F8AC30 		str	r3, [r4, #172]
+ 252 0096 C7E7     		b	.L8
+ 253              		.cfi_endproc
+ 254              	.LFE67:
+ 256              		.section	.text.K230ToStm32FeedByte,"ax",%progbits
+ 257              		.align	1
+ 258              		.syntax unified
+ 259              		.thumb
+ 260              		.thumb_func
+ 262              	K230ToStm32FeedByte:
+ 263              	.LVL20:
+ 264              	.LFB68:
+ 125:modules/k230_to_stm32.c **** 
+ 126:modules/k230_to_stm32.c **** /**
+ 127:modules/k230_to_stm32.c ****  * @brief 逐字节喂入解析状态机。
+ 128:modules/k230_to_stm32.c ****  *
+ 129:modules/k230_to_stm32.c ****  * parse_index 表示「已经收了多少字节」：
+ 130:modules/k230_to_stm32.c ****  *   0 ~ 3  : 正在匹配 4 字节帧头。失配时回退重试当前字节，这样即使出现
+ 131:modules/k230_to_stm32.c ****  *            ... AA AA 55 01 08 ... 这种帧头被前缀污染的流，也不会漏掉
+ 132:modules/k230_to_stm32.c ****  *            后面那一帧的帧头。
+ 133:modules/k230_to_stm32.c ****  *   4 ~ 11 : 正在收集 8 字节载荷。
+ 134:modules/k230_to_stm32.c ****  *   12     : 收到校验字节，交给 K230ToStm32HandleFrame() 处理。
+ 135:modules/k230_to_stm32.c ****  *
+ 136:modules/k230_to_stm32.c ****  * @note 在接收中断中执行，必须保持短小（开发规范 §8.1）。
+ 137:modules/k230_to_stm32.c ****  */
+ 138:modules/k230_to_stm32.c **** static void K230ToStm32FeedByte(K230ToStm32Instance *instance, uint8_t byte)
+ 139:modules/k230_to_stm32.c **** {
+ 265              		.loc 1 139 1 is_stmt 1 view -0
+ 266              		.cfi_startproc
+ 267              		@ args = 0, pretend = 0, frame = 0
+ 268              		@ frame_needed = 0, uses_anonymous_args = 0
+ 269              		.loc 1 139 1 is_stmt 0 view .LVU80
+ 270 0000 08B5     		push	{r3, lr}
+ 271              	.LCFI1:
+ 272              		.cfi_def_cfa_offset 8
+ 273              		.cfi_offset 3, -8
+ 274              		.cfi_offset 14, -4
+ 140:modules/k230_to_stm32.c ****     /* ---- 阶段一：匹配帧头 ---- */
+ 141:modules/k230_to_stm32.c ****     if (instance->parse_index < K230_FRAME_HEADER_LEN) {
+ 275              		.loc 1 141 5 is_stmt 1 view .LVU81
+ 276              		.loc 1 141 17 is_stmt 0 view .LVU82
+ 277 0002 0379     		ldrb	r3, [r0, #4]	@ zero_extendqisi2
+ 278              		.loc 1 141 8 view .LVU83
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 9
+
+
+ 279 0004 032B     		cmp	r3, #3
+ 280 0006 07D9     		bls	.L21
+ 142:modules/k230_to_stm32.c ****         if (byte == k230_frame_header[instance->parse_index]) {
+ 143:modules/k230_to_stm32.c ****             instance->frame_buf[instance->parse_index] = byte;
+ 144:modules/k230_to_stm32.c ****             instance->parse_index++;
+ 145:modules/k230_to_stm32.c ****         } else {
+ 146:modules/k230_to_stm32.c ****             /* 失配，重新开始同步。当前字节本身可能是新帧头的第一个字节
+ 147:modules/k230_to_stm32.c ****                所以要用 header[0] 再比对一次，不能直接丢弃 */
+ 148:modules/k230_to_stm32.c ****             instance->parse_index = 0u;
+ 149:modules/k230_to_stm32.c ****             if (byte == k230_frame_header[0]) {
+ 150:modules/k230_to_stm32.c ****                 instance->frame_buf[0] = byte;
+ 151:modules/k230_to_stm32.c ****                 instance->parse_index  = 1u;
+ 152:modules/k230_to_stm32.c ****             }
+ 153:modules/k230_to_stm32.c ****         }
+ 154:modules/k230_to_stm32.c ****         return;
+ 155:modules/k230_to_stm32.c ****     }
+ 156:modules/k230_to_stm32.c **** 
+ 157:modules/k230_to_stm32.c ****     /* ---- 阶段二：收集载荷与校验字节 ---- */
+ 158:modules/k230_to_stm32.c ****     instance->frame_buf[instance->parse_index] = byte;
+ 281              		.loc 1 158 5 is_stmt 1 view .LVU84
+ 282              		.loc 1 158 48 is_stmt 0 view .LVU85
+ 283 0008 C218     		adds	r2, r0, r3
+ 284 000a 5171     		strb	r1, [r2, #5]
+ 159:modules/k230_to_stm32.c ****     instance->parse_index++;
+ 285              		.loc 1 159 5 is_stmt 1 view .LVU86
+ 286              		.loc 1 159 26 is_stmt 0 view .LVU87
+ 287 000c 0133     		adds	r3, r3, #1
+ 288 000e DBB2     		uxtb	r3, r3
+ 289 0010 0371     		strb	r3, [r0, #4]
+ 160:modules/k230_to_stm32.c **** 
+ 161:modules/k230_to_stm32.c ****     if (instance->parse_index < K230_FRAME_LEN) {
+ 290              		.loc 1 161 5 is_stmt 1 view .LVU88
+ 291              		.loc 1 161 8 is_stmt 0 view .LVU89
+ 292 0012 0C2B     		cmp	r3, #12
+ 293 0014 11D8     		bhi	.L22
+ 294              	.LVL21:
+ 295              	.L15:
+ 162:modules/k230_to_stm32.c ****         return;
+ 163:modules/k230_to_stm32.c ****     }
+ 164:modules/k230_to_stm32.c **** 
+ 165:modules/k230_to_stm32.c ****     /* 一帧收齐，先复位状态机再处理，保证下一字节重新从帧头开始匹配 *
+ 166:modules/k230_to_stm32.c ****     instance->parse_index = 0u;
+ 167:modules/k230_to_stm32.c ****     K230ToStm32HandleFrame(instance);
+ 168:modules/k230_to_stm32.c **** }
+ 296              		.loc 1 168 1 view .LVU90
+ 297 0016 08BD     		pop	{r3, pc}
+ 298              	.LVL22:
+ 299              	.L21:
+ 142:modules/k230_to_stm32.c ****             instance->frame_buf[instance->parse_index] = byte;
+ 300              		.loc 1 142 9 is_stmt 1 view .LVU91
+ 142:modules/k230_to_stm32.c ****             instance->frame_buf[instance->parse_index] = byte;
+ 301              		.loc 1 142 38 is_stmt 0 view .LVU92
+ 302 0018 0A4A     		ldr	r2, .L24
+ 303 001a D25C     		ldrb	r2, [r2, r3]	@ zero_extendqisi2
+ 142:modules/k230_to_stm32.c ****             instance->frame_buf[instance->parse_index] = byte;
+ 304              		.loc 1 142 12 view .LVU93
+ 305 001c 8A42     		cmp	r2, r1
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 10
+
+
+ 306 001e 07D0     		beq	.L23
+ 148:modules/k230_to_stm32.c ****             if (byte == k230_frame_header[0]) {
+ 307              		.loc 1 148 13 is_stmt 1 view .LVU94
+ 148:modules/k230_to_stm32.c ****             if (byte == k230_frame_header[0]) {
+ 308              		.loc 1 148 35 is_stmt 0 view .LVU95
+ 309 0020 0023     		movs	r3, #0
+ 310 0022 0371     		strb	r3, [r0, #4]
+ 149:modules/k230_to_stm32.c ****                 instance->frame_buf[0] = byte;
+ 311              		.loc 1 149 13 is_stmt 1 view .LVU96
+ 149:modules/k230_to_stm32.c ****                 instance->frame_buf[0] = byte;
+ 312              		.loc 1 149 16 is_stmt 0 view .LVU97
+ 313 0024 AA29     		cmp	r1, #170
+ 314 0026 F6D1     		bne	.L15
+ 150:modules/k230_to_stm32.c ****                 instance->parse_index  = 1u;
+ 315              		.loc 1 150 17 is_stmt 1 view .LVU98
+ 150:modules/k230_to_stm32.c ****                 instance->parse_index  = 1u;
+ 316              		.loc 1 150 40 is_stmt 0 view .LVU99
+ 317 0028 4171     		strb	r1, [r0, #5]
+ 151:modules/k230_to_stm32.c ****             }
+ 318              		.loc 1 151 17 is_stmt 1 view .LVU100
+ 151:modules/k230_to_stm32.c ****             }
+ 319              		.loc 1 151 40 is_stmt 0 view .LVU101
+ 320 002a 0123     		movs	r3, #1
+ 321 002c 0371     		strb	r3, [r0, #4]
+ 154:modules/k230_to_stm32.c ****     }
+ 322              		.loc 1 154 9 is_stmt 1 view .LVU102
+ 323 002e F2E7     		b	.L15
+ 324              	.L23:
+ 143:modules/k230_to_stm32.c ****             instance->parse_index++;
+ 325              		.loc 1 143 13 view .LVU103
+ 143:modules/k230_to_stm32.c ****             instance->parse_index++;
+ 326              		.loc 1 143 56 is_stmt 0 view .LVU104
+ 327 0030 C218     		adds	r2, r0, r3
+ 328 0032 5171     		strb	r1, [r2, #5]
+ 144:modules/k230_to_stm32.c ****         } else {
+ 329              		.loc 1 144 13 is_stmt 1 view .LVU105
+ 144:modules/k230_to_stm32.c ****         } else {
+ 330              		.loc 1 144 34 is_stmt 0 view .LVU106
+ 331 0034 0133     		adds	r3, r3, #1
+ 332 0036 0371     		strb	r3, [r0, #4]
+ 333 0038 EDE7     		b	.L15
+ 334              	.L22:
+ 166:modules/k230_to_stm32.c ****     K230ToStm32HandleFrame(instance);
+ 335              		.loc 1 166 5 is_stmt 1 view .LVU107
+ 166:modules/k230_to_stm32.c ****     K230ToStm32HandleFrame(instance);
+ 336              		.loc 1 166 27 is_stmt 0 view .LVU108
+ 337 003a 0023     		movs	r3, #0
+ 338 003c 0371     		strb	r3, [r0, #4]
+ 167:modules/k230_to_stm32.c **** }
+ 339              		.loc 1 167 5 is_stmt 1 view .LVU109
+ 340 003e FFF7FEFF 		bl	K230ToStm32HandleFrame
+ 341              	.LVL23:
+ 167:modules/k230_to_stm32.c **** }
+ 342              		.loc 1 167 5 is_stmt 0 view .LVU110
+ 343 0042 E8E7     		b	.L15
+ 344              	.L25:
+ 345              		.align	2
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 11
+
+
+ 346              	.L24:
+ 347 0044 00000000 		.word	k230_frame_header
+ 348              		.cfi_endproc
+ 349              	.LFE68:
+ 351              		.section	.text.K230ToStm32OnRxData,"ax",%progbits
+ 352              		.align	1
+ 353              		.syntax unified
+ 354              		.thumb
+ 355              		.thumb_func
+ 357              	K230ToStm32OnRxData:
+ 358              	.LVL24:
+ 359              	.LFB69:
+ 169:modules/k230_to_stm32.c **** 
+ 170:modules/k230_to_stm32.c **** /**
+ 171:modules/k230_to_stm32.c ****  * @brief BSP 接收回调，**在串口中断上下文中执行**。
+ 172:modules/k230_to_stm32.c ****  *
+ 173:modules/k230_to_stm32.c ****  * @param usart_instance 触发的 BSP 实例。
+ 174:modules/k230_to_stm32.c ****  * @param data           本次收到的数据块。
+ 175:modules/k230_to_stm32.c ****  * @param len            字节数。
+ 176:modules/k230_to_stm32.c ****  */
+ 177:modules/k230_to_stm32.c **** static void K230ToStm32OnRxData(K230UsartInstance *usart_instance, const uint8_t *data, uint16_t le
+ 178:modules/k230_to_stm32.c **** {
+ 360              		.loc 1 178 1 is_stmt 1 view -0
+ 361              		.cfi_startproc
+ 362              		@ args = 0, pretend = 0, frame = 0
+ 363              		@ frame_needed = 0, uses_anonymous_args = 0
+ 179:modules/k230_to_stm32.c ****     if ((usart_instance == NULL) || (data == NULL) || (len == 0u)) {
+ 364              		.loc 1 179 5 view .LVU112
+ 365              		.loc 1 179 8 is_stmt 0 view .LVU113
+ 366 0000 88B1     		cbz	r0, .L31
+ 178:modules/k230_to_stm32.c ****     if ((usart_instance == NULL) || (data == NULL) || (len == 0u)) {
+ 367              		.loc 1 178 1 view .LVU114
+ 368 0002 F8B5     		push	{r3, r4, r5, r6, r7, lr}
+ 369              	.LCFI2:
+ 370              		.cfi_def_cfa_offset 24
+ 371              		.cfi_offset 3, -24
+ 372              		.cfi_offset 4, -20
+ 373              		.cfi_offset 5, -16
+ 374              		.cfi_offset 6, -12
+ 375              		.cfi_offset 7, -8
+ 376              		.cfi_offset 14, -4
+ 377 0004 0E46     		mov	r6, r1
+ 378 0006 1546     		mov	r5, r2
+ 379              		.loc 1 179 34 discriminator 1 view .LVU115
+ 380 0008 61B1     		cbz	r1, .L26
+ 381              		.loc 1 179 52 discriminator 2 view .LVU116
+ 382 000a 5AB1     		cbz	r2, .L26
+ 180:modules/k230_to_stm32.c ****         return;
+ 181:modules/k230_to_stm32.c ****     }
+ 182:modules/k230_to_stm32.c **** 
+ 183:modules/k230_to_stm32.c ****     /* BSP 层通过 parent 指针回传上层实例，BSP 不需要包含本模块头文件
+ 184:modules/k230_to_stm32.c ****        （开发规范 §6.4） */
+ 185:modules/k230_to_stm32.c ****     K230ToStm32Instance *instance = (K230ToStm32Instance *)usart_instance->parent;
+ 383              		.loc 1 185 5 is_stmt 1 view .LVU117
+ 384              		.loc 1 185 26 is_stmt 0 view .LVU118
+ 385 000c 0769     		ldr	r7, [r0, #16]
+ 386              	.LVL25:
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 12
+
+
+ 186:modules/k230_to_stm32.c ****     if (instance == NULL) {
+ 387              		.loc 1 186 5 is_stmt 1 view .LVU119
+ 388              		.loc 1 186 8 is_stmt 0 view .LVU120
+ 389 000e 4FB1     		cbz	r7, .L26
+ 390              	.LBB10:
+ 187:modules/k230_to_stm32.c ****         return;
+ 188:modules/k230_to_stm32.c ****     }
+ 189:modules/k230_to_stm32.c **** 
+ 190:modules/k230_to_stm32.c ****     for (uint16_t i = 0u; i < len; i++) {
+ 391              		.loc 1 190 19 view .LVU121
+ 392 0010 0024     		movs	r4, #0
+ 393 0012 05E0     		b	.L28
+ 394              	.LVL26:
+ 395              	.L29:
+ 191:modules/k230_to_stm32.c ****         K230ToStm32FeedByte(instance, data[i]);
+ 396              		.loc 1 191 9 is_stmt 1 view .LVU122
+ 397 0014 315D     		ldrb	r1, [r6, r4]	@ zero_extendqisi2
+ 398 0016 3846     		mov	r0, r7
+ 399 0018 FFF7FEFF 		bl	K230ToStm32FeedByte
+ 400              	.LVL27:
+ 190:modules/k230_to_stm32.c ****         K230ToStm32FeedByte(instance, data[i]);
+ 401              		.loc 1 190 37 discriminator 3 view .LVU123
+ 402 001c 0134     		adds	r4, r4, #1
+ 403              	.LVL28:
+ 190:modules/k230_to_stm32.c ****         K230ToStm32FeedByte(instance, data[i]);
+ 404              		.loc 1 190 37 is_stmt 0 discriminator 3 view .LVU124
+ 405 001e A4B2     		uxth	r4, r4
+ 406              	.LVL29:
+ 407              	.L28:
+ 190:modules/k230_to_stm32.c ****         K230ToStm32FeedByte(instance, data[i]);
+ 408              		.loc 1 190 29 is_stmt 1 discriminator 1 view .LVU125
+ 409 0020 AC42     		cmp	r4, r5
+ 410 0022 F7D3     		bcc	.L29
+ 411              	.LVL30:
+ 412              	.L26:
+ 190:modules/k230_to_stm32.c ****         K230ToStm32FeedByte(instance, data[i]);
+ 413              		.loc 1 190 29 is_stmt 0 discriminator 1 view .LVU126
+ 414              	.LBE10:
+ 192:modules/k230_to_stm32.c ****     }
+ 193:modules/k230_to_stm32.c **** }
+ 415              		.loc 1 193 1 view .LVU127
+ 416 0024 F8BD     		pop	{r3, r4, r5, r6, r7, pc}
+ 417              	.LVL31:
+ 418              	.L31:
+ 419              	.LCFI3:
+ 420              		.cfi_def_cfa_offset 0
+ 421              		.cfi_restore 3
+ 422              		.cfi_restore 4
+ 423              		.cfi_restore 5
+ 424              		.cfi_restore 6
+ 425              		.cfi_restore 7
+ 426              		.cfi_restore 14
+ 427              		.loc 1 193 1 view .LVU128
+ 428 0026 7047     		bx	lr
+ 429              		.cfi_endproc
+ 430              	.LFE69:
+ 432              		.section	.text.K230ToStm32IsOnlineAt,"ax",%progbits
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 13
+
+
+ 433              		.align	1
+ 434              		.syntax unified
+ 435              		.thumb
+ 436              		.thumb_func
+ 438              	K230ToStm32IsOnlineAt:
+ 439              	.LVL32:
+ 440              	.LFB74:
+ 194:modules/k230_to_stm32.c **** 
+ 195:modules/k230_to_stm32.c **** /* ============================ 外部接口 ============================ */
+ 196:modules/k230_to_stm32.c **** 
+ 197:modules/k230_to_stm32.c **** uint8_t k230_to_stm32_Init(UART_HandleTypeDef *uart_handle)
+ 198:modules/k230_to_stm32.c **** {
+ 199:modules/k230_to_stm32.c ****     K230ToStm32_Init_Config_s config = {
+ 200:modules/k230_to_stm32.c ****         .uart_handle = uart_handle,
+ 201:modules/k230_to_stm32.c ****     };
+ 202:modules/k230_to_stm32.c **** 
+ 203:modules/k230_to_stm32.c ****     /* 传入 NULL 时 K230ToStm32Register() 会直接返回 NULL，统一走下面的失败分支 
+ 204:modules/k230_to_stm32.c ****     k230_to_stm32_instance = K230ToStm32Register(&config);
+ 205:modules/k230_to_stm32.c ****     if (k230_to_stm32_instance == NULL) {
+ 206:modules/k230_to_stm32.c ****         return 0u;
+ 207:modules/k230_to_stm32.c ****     }
+ 208:modules/k230_to_stm32.c **** 
+ 209:modules/k230_to_stm32.c ****     return K230ToStm32Start(k230_to_stm32_instance);
+ 210:modules/k230_to_stm32.c **** }
+ 211:modules/k230_to_stm32.c **** 
+ 212:modules/k230_to_stm32.c **** /**
+ 213:modules/k230_to_stm32.c ****  * @brief 获取 k230_to_stm32_Init() 创建的默认 K230 实例。
+ 214:modules/k230_to_stm32.c ****  *
+ 215:modules/k230_to_stm32.c ****  * @return 默认实例指针；尚未初始化或初始化失败时返回 NULL。
+ 216:modules/k230_to_stm32.c ****  */
+ 217:modules/k230_to_stm32.c **** K230ToStm32Instance *K230ToStm32GetInstance(void)
+ 218:modules/k230_to_stm32.c **** {
+ 219:modules/k230_to_stm32.c ****     return k230_to_stm32_instance;
+ 220:modules/k230_to_stm32.c **** }
+ 221:modules/k230_to_stm32.c **** 
+ 222:modules/k230_to_stm32.c **** K230ToStm32Instance *K230ToStm32Register(const K230ToStm32_Init_Config_s *config)
+ 223:modules/k230_to_stm32.c **** {
+ 224:modules/k230_to_stm32.c ****     if ((config == NULL) || (config->uart_handle == NULL)) {
+ 225:modules/k230_to_stm32.c ****         return NULL;
+ 226:modules/k230_to_stm32.c ****     }
+ 227:modules/k230_to_stm32.c **** 
+ 228:modules/k230_to_stm32.c ****     K230ToStm32Instance *instance = NULL;
+ 229:modules/k230_to_stm32.c ****     for (uint8_t i = 0u; i < K230_TO_STM32_MAX_INSTANCE; i++) {
+ 230:modules/k230_to_stm32.c ****         if (k230_to_stm32_pool[i].usart_instance == NULL) {
+ 231:modules/k230_to_stm32.c ****             instance = &k230_to_stm32_pool[i];
+ 232:modules/k230_to_stm32.c ****             break;
+ 233:modules/k230_to_stm32.c ****         }
+ 234:modules/k230_to_stm32.c ****     }
+ 235:modules/k230_to_stm32.c ****     if (instance == NULL) {
+ 236:modules/k230_to_stm32.c ****         return NULL; /* 实例池已满 */
+ 237:modules/k230_to_stm32.c ****     }
+ 238:modules/k230_to_stm32.c **** 
+ 239:modules/k230_to_stm32.c ****     memset(instance, 0, sizeof(K230ToStm32Instance));
+ 240:modules/k230_to_stm32.c **** 
+ 241:modules/k230_to_stm32.c ****     /* 把本模块挂到 BSP 层：数据到达后由 BSP 回调 K230ToStm32OnRxData */
+ 242:modules/k230_to_stm32.c ****     K230Usart_Init_Config_s usart_config = {
+ 243:modules/k230_to_stm32.c ****         .uart_handle = config->uart_handle,
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 14
+
+
+ 244:modules/k230_to_stm32.c ****         .rx_buf      = instance->rx_buf,
+ 245:modules/k230_to_stm32.c ****         .rx_buf_size = K230_RX_BUF_SIZE,
+ 246:modules/k230_to_stm32.c ****         .parent      = instance,
+ 247:modules/k230_to_stm32.c ****         .rx_callback = K230ToStm32OnRxData,
+ 248:modules/k230_to_stm32.c ****     };
+ 249:modules/k230_to_stm32.c **** 
+ 250:modules/k230_to_stm32.c ****     instance->usart_instance = K230UsartRegister(&usart_config);
+ 251:modules/k230_to_stm32.c ****     if (instance->usart_instance == NULL) {
+ 252:modules/k230_to_stm32.c ****         return NULL;
+ 253:modules/k230_to_stm32.c ****     }
+ 254:modules/k230_to_stm32.c **** 
+ 255:modules/k230_to_stm32.c ****     return instance;
+ 256:modules/k230_to_stm32.c **** }
+ 257:modules/k230_to_stm32.c **** 
+ 258:modules/k230_to_stm32.c **** uint8_t K230ToStm32Start(K230ToStm32Instance *instance)
+ 259:modules/k230_to_stm32.c **** {
+ 260:modules/k230_to_stm32.c ****     if (instance == NULL) {
+ 261:modules/k230_to_stm32.c ****         return 0u;
+ 262:modules/k230_to_stm32.c ****     }
+ 263:modules/k230_to_stm32.c **** 
+ 264:modules/k230_to_stm32.c ****     return (K230UsartStart(instance->usart_instance) == HAL_OK) ? 1u : 0u;
+ 265:modules/k230_to_stm32.c **** }
+ 266:modules/k230_to_stm32.c **** 
+ 267:modules/k230_to_stm32.c **** /**
+ 268:modules/k230_to_stm32.c ****  * @brief 按给定的帧计数与时间戳判断链路是否在线。
+ 269:modules/k230_to_stm32.c ****  *
+ 270:modules/k230_to_stm32.c ****  * @note 抽成独立函数是为了让「读取快照」和「实时查询」两条路径共用同
+ 271:modules/k230_to_stm32.c ****  *       超时判据，避免两处阈值逻辑各写一遍后走偏。
+ 272:modules/k230_to_stm32.c ****  */
+ 273:modules/k230_to_stm32.c **** static uint8_t K230ToStm32IsOnlineAt(uint32_t frame_count, uint32_t last_frame_time_ms)
+ 274:modules/k230_to_stm32.c **** {
+ 441              		.loc 1 274 1 is_stmt 1 view -0
+ 442              		.cfi_startproc
+ 443              		@ args = 0, pretend = 0, frame = 0
+ 444              		@ frame_needed = 0, uses_anonymous_args = 0
+ 275:modules/k230_to_stm32.c ****     /* 开机后一帧都没收到过，不能算在线 */
+ 276:modules/k230_to_stm32.c ****     if (frame_count == 0u) {
+ 445              		.loc 1 276 5 view .LVU130
+ 446              		.loc 1 276 8 is_stmt 0 view .LVU131
+ 447 0000 08B9     		cbnz	r0, .L42
+ 277:modules/k230_to_stm32.c ****         return 0u;
+ 448              		.loc 1 277 16 view .LVU132
+ 449 0002 0020     		movs	r0, #0
+ 450              	.LVL33:
+ 278:modules/k230_to_stm32.c ****     }
+ 279:modules/k230_to_stm32.c **** 
+ 280:modules/k230_to_stm32.c ****     /* 无符号相减，HAL_GetTick() 回绕（约 49.7 天）时结果依然正确 */
+ 281:modules/k230_to_stm32.c ****     uint32_t elapsed_ms = HAL_GetTick() - last_frame_time_ms;
+ 282:modules/k230_to_stm32.c **** 
+ 283:modules/k230_to_stm32.c ****     return (elapsed_ms <= K230_VISION_TIMEOUT_MS) ? 1u : 0u;
+ 284:modules/k230_to_stm32.c **** }
+ 451              		.loc 1 284 1 view .LVU133
+ 452 0004 7047     		bx	lr
+ 453              	.LVL34:
+ 454              	.L42:
+ 274:modules/k230_to_stm32.c ****     /* 开机后一帧都没收到过，不能算在线 */
+ 455              		.loc 1 274 1 view .LVU134
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 15
+
+
+ 456 0006 10B5     		push	{r4, lr}
+ 457              	.LCFI4:
+ 458              		.cfi_def_cfa_offset 8
+ 459              		.cfi_offset 4, -8
+ 460              		.cfi_offset 14, -4
+ 461 0008 0C46     		mov	r4, r1
+ 281:modules/k230_to_stm32.c **** 
+ 462              		.loc 1 281 5 is_stmt 1 view .LVU135
+ 281:modules/k230_to_stm32.c **** 
+ 463              		.loc 1 281 27 is_stmt 0 view .LVU136
+ 464 000a FFF7FEFF 		bl	HAL_GetTick
+ 465              	.LVL35:
+ 281:modules/k230_to_stm32.c **** 
+ 466              		.loc 1 281 14 discriminator 1 view .LVU137
+ 467 000e 001B     		subs	r0, r0, r4
+ 468              	.LVL36:
+ 283:modules/k230_to_stm32.c **** }
+ 469              		.loc 1 283 5 is_stmt 1 view .LVU138
+ 283:modules/k230_to_stm32.c **** }
+ 470              		.loc 1 283 56 is_stmt 0 view .LVU139
+ 471 0010 C828     		cmp	r0, #200
+ 472 0012 01D8     		bhi	.L37
+ 283:modules/k230_to_stm32.c **** }
+ 473              		.loc 1 283 56 discriminator 1 view .LVU140
+ 474 0014 0120     		movs	r0, #1
+ 475              	.LVL37:
+ 476              	.L35:
+ 477              		.loc 1 284 1 view .LVU141
+ 478 0016 10BD     		pop	{r4, pc}
+ 479              	.LVL38:
+ 480              	.L37:
+ 283:modules/k230_to_stm32.c **** }
+ 481              		.loc 1 283 56 discriminator 2 view .LVU142
+ 482 0018 0020     		movs	r0, #0
+ 483              	.LVL39:
+ 283:modules/k230_to_stm32.c **** }
+ 484              		.loc 1 283 56 discriminator 2 view .LVU143
+ 485 001a FCE7     		b	.L35
+ 486              		.cfi_endproc
+ 487              	.LFE74:
+ 489              		.section	.text.K230ToStm32GetInstance,"ax",%progbits
+ 490              		.align	1
+ 491              		.global	K230ToStm32GetInstance
+ 492              		.syntax unified
+ 493              		.thumb
+ 494              		.thumb_func
+ 496              	K230ToStm32GetInstance:
+ 497              	.LFB71:
+ 218:modules/k230_to_stm32.c ****     return k230_to_stm32_instance;
+ 498              		.loc 1 218 1 is_stmt 1 view -0
+ 499              		.cfi_startproc
+ 500              		@ args = 0, pretend = 0, frame = 0
+ 501              		@ frame_needed = 0, uses_anonymous_args = 0
+ 502              		@ link register save eliminated.
+ 219:modules/k230_to_stm32.c **** }
+ 503              		.loc 1 219 5 view .LVU145
+ 220:modules/k230_to_stm32.c **** 
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 16
+
+
+ 504              		.loc 1 220 1 is_stmt 0 view .LVU146
+ 505 0000 014B     		ldr	r3, .L44
+ 506 0002 1868     		ldr	r0, [r3]
+ 507 0004 7047     		bx	lr
+ 508              	.L45:
+ 509 0006 00BF     		.align	2
+ 510              	.L44:
+ 511 0008 00000000 		.word	k230_to_stm32_instance
+ 512              		.cfi_endproc
+ 513              	.LFE71:
+ 515              		.section	.text.K230ToStm32Register,"ax",%progbits
+ 516              		.align	1
+ 517              		.global	K230ToStm32Register
+ 518              		.syntax unified
+ 519              		.thumb
+ 520              		.thumb_func
+ 522              	K230ToStm32Register:
+ 523              	.LVL40:
+ 524              	.LFB72:
+ 223:modules/k230_to_stm32.c ****     if ((config == NULL) || (config->uart_handle == NULL)) {
+ 525              		.loc 1 223 1 is_stmt 1 view -0
+ 526              		.cfi_startproc
+ 527              		@ args = 0, pretend = 0, frame = 24
+ 528              		@ frame_needed = 0, uses_anonymous_args = 0
+ 223:modules/k230_to_stm32.c ****     if ((config == NULL) || (config->uart_handle == NULL)) {
+ 529              		.loc 1 223 1 is_stmt 0 view .LVU148
+ 530 0000 F0B5     		push	{r4, r5, r6, r7, lr}
+ 531              	.LCFI5:
+ 532              		.cfi_def_cfa_offset 20
+ 533              		.cfi_offset 4, -20
+ 534              		.cfi_offset 5, -16
+ 535              		.cfi_offset 6, -12
+ 536              		.cfi_offset 7, -8
+ 537              		.cfi_offset 14, -4
+ 538 0002 87B0     		sub	sp, sp, #28
+ 539              	.LCFI6:
+ 540              		.cfi_def_cfa_offset 48
+ 224:modules/k230_to_stm32.c ****         return NULL;
+ 541              		.loc 1 224 5 is_stmt 1 view .LVU149
+ 224:modules/k230_to_stm32.c ****         return NULL;
+ 542              		.loc 1 224 8 is_stmt 0 view .LVU150
+ 543 0004 0646     		mov	r6, r0
+ 544 0006 60B3     		cbz	r0, .L51
+ 224:modules/k230_to_stm32.c ****         return NULL;
+ 545              		.loc 1 224 36 discriminator 1 view .LVU151
+ 546 0008 0568     		ldr	r5, [r0]
+ 224:modules/k230_to_stm32.c ****         return NULL;
+ 547              		.loc 1 224 26 discriminator 1 view .LVU152
+ 548 000a 15B1     		cbz	r5, .L46
+ 549              	.LBB11:
+ 229:modules/k230_to_stm32.c ****         if (k230_to_stm32_pool[i].usart_instance == NULL) {
+ 550              		.loc 1 229 18 view .LVU153
+ 551 000c 0023     		movs	r3, #0
+ 552              	.L48:
+ 553              	.LVL41:
+ 229:modules/k230_to_stm32.c ****         if (k230_to_stm32_pool[i].usart_instance == NULL) {
+ 554              		.loc 1 229 28 is_stmt 1 discriminator 1 view .LVU154
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 17
+
+
+ 555 000e 1BB1     		cbz	r3, .L50
+ 556              	.LBE11:
+ 236:modules/k230_to_stm32.c ****     }
+ 557              		.loc 1 236 16 is_stmt 0 view .LVU155
+ 558 0010 0025     		movs	r5, #0
+ 559              	.LVL42:
+ 560              	.L46:
+ 256:modules/k230_to_stm32.c **** 
+ 561              		.loc 1 256 1 view .LVU156
+ 562 0012 2846     		mov	r0, r5
+ 563 0014 07B0     		add	sp, sp, #28
+ 564              	.LCFI7:
+ 565              		.cfi_remember_state
+ 566              		.cfi_def_cfa_offset 20
+ 567              		@ sp needed
+ 568 0016 F0BD     		pop	{r4, r5, r6, r7, pc}
+ 569              	.LVL43:
+ 570              	.L50:
+ 571              	.LCFI8:
+ 572              		.cfi_restore_state
+ 573              	.LBB12:
+ 230:modules/k230_to_stm32.c ****             instance = &k230_to_stm32_pool[i];
+ 574              		.loc 1 230 9 is_stmt 1 view .LVU157
+ 230:modules/k230_to_stm32.c ****             instance = &k230_to_stm32_pool[i];
+ 575              		.loc 1 230 34 is_stmt 0 view .LVU158
+ 576 0018 B022     		movs	r2, #176
+ 577 001a 03FB02F2 		mul	r2, r3, r2
+ 578 001e 1249     		ldr	r1, .L55
+ 579 0020 8A58     		ldr	r2, [r1, r2]
+ 230:modules/k230_to_stm32.c ****             instance = &k230_to_stm32_pool[i];
+ 580              		.loc 1 230 12 view .LVU159
+ 581 0022 12B1     		cbz	r2, .L54
+ 229:modules/k230_to_stm32.c ****         if (k230_to_stm32_pool[i].usart_instance == NULL) {
+ 582              		.loc 1 229 59 is_stmt 1 discriminator 2 view .LVU160
+ 583 0024 0133     		adds	r3, r3, #1
+ 584              	.LVL44:
+ 229:modules/k230_to_stm32.c ****         if (k230_to_stm32_pool[i].usart_instance == NULL) {
+ 585              		.loc 1 229 59 is_stmt 0 discriminator 2 view .LVU161
+ 586 0026 DBB2     		uxtb	r3, r3
+ 587 0028 F1E7     		b	.L48
+ 588              	.LVL45:
+ 589              	.L54:
+ 231:modules/k230_to_stm32.c ****             break;
+ 590              		.loc 1 231 13 is_stmt 1 view .LVU162
+ 231:modules/k230_to_stm32.c ****             break;
+ 591              		.loc 1 231 22 is_stmt 0 view .LVU163
+ 592 002a B022     		movs	r2, #176
+ 593 002c 02FB03F4 		mul	r4, r2, r3
+ 594 0030 0F46     		mov	r7, r1
+ 595 0032 6518     		adds	r5, r4, r1
+ 596              	.LVL46:
+ 232:modules/k230_to_stm32.c ****         }
+ 597              		.loc 1 232 13 is_stmt 1 view .LVU164
+ 232:modules/k230_to_stm32.c ****         }
+ 598              		.loc 1 232 13 is_stmt 0 view .LVU165
+ 599              	.LBE12:
+ 235:modules/k230_to_stm32.c ****         return NULL; /* 实例池已满 */
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 18
+
+
+ 600              		.loc 1 235 5 is_stmt 1 view .LVU166
+ 239:modules/k230_to_stm32.c **** 
+ 601              		.loc 1 239 5 view .LVU167
+ 602 0034 0021     		movs	r1, #0
+ 603 0036 2846     		mov	r0, r5
+ 604              	.LVL47:
+ 239:modules/k230_to_stm32.c **** 
+ 605              		.loc 1 239 5 is_stmt 0 view .LVU168
+ 606 0038 FFF7FEFF 		bl	memset
+ 607              	.LVL48:
+ 242:modules/k230_to_stm32.c ****         .uart_handle = config->uart_handle,
+ 608              		.loc 1 242 5 is_stmt 1 view .LVU169
+ 243:modules/k230_to_stm32.c ****         .rx_buf      = instance->rx_buf,
+ 609              		.loc 1 243 30 is_stmt 0 view .LVU170
+ 610 003c 3368     		ldr	r3, [r6]
+ 242:modules/k230_to_stm32.c ****         .uart_handle = config->uart_handle,
+ 611              		.loc 1 242 29 view .LVU171
+ 612 003e 0193     		str	r3, [sp, #4]
+ 244:modules/k230_to_stm32.c ****         .rx_buf_size = K230_RX_BUF_SIZE,
+ 613              		.loc 1 244 24 view .LVU172
+ 614 0040 05F11203 		add	r3, r5, #18
+ 242:modules/k230_to_stm32.c ****         .uart_handle = config->uart_handle,
+ 615              		.loc 1 242 29 view .LVU173
+ 616 0044 0293     		str	r3, [sp, #8]
+ 617 0046 8023     		movs	r3, #128
+ 618 0048 ADF80C30 		strh	r3, [sp, #12]	@ movhi
+ 619 004c 0495     		str	r5, [sp, #16]
+ 620 004e 074B     		ldr	r3, .L55+4
+ 621 0050 0593     		str	r3, [sp, #20]
+ 250:modules/k230_to_stm32.c ****     if (instance->usart_instance == NULL) {
+ 622              		.loc 1 250 5 is_stmt 1 view .LVU174
+ 250:modules/k230_to_stm32.c ****     if (instance->usart_instance == NULL) {
+ 623              		.loc 1 250 32 is_stmt 0 view .LVU175
+ 624 0052 01A8     		add	r0, sp, #4
+ 625 0054 FFF7FEFF 		bl	K230UsartRegister
+ 626              	.LVL49:
+ 250:modules/k230_to_stm32.c ****     if (instance->usart_instance == NULL) {
+ 627              		.loc 1 250 30 discriminator 1 view .LVU176
+ 628 0058 3851     		str	r0, [r7, r4]
+ 251:modules/k230_to_stm32.c ****         return NULL;
+ 629              		.loc 1 251 5 is_stmt 1 view .LVU177
+ 251:modules/k230_to_stm32.c ****         return NULL;
+ 630              		.loc 1 251 8 is_stmt 0 view .LVU178
+ 631 005a 0028     		cmp	r0, #0
+ 632 005c D9D1     		bne	.L46
+ 252:modules/k230_to_stm32.c ****     }
+ 633              		.loc 1 252 16 view .LVU179
+ 634 005e 0546     		mov	r5, r0
+ 635              	.LVL50:
+ 252:modules/k230_to_stm32.c ****     }
+ 636              		.loc 1 252 16 view .LVU180
+ 637 0060 D7E7     		b	.L46
+ 638              	.LVL51:
+ 639              	.L51:
+ 225:modules/k230_to_stm32.c ****     }
+ 640              		.loc 1 225 16 view .LVU181
+ 641 0062 0546     		mov	r5, r0
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 19
+
+
+ 642 0064 D5E7     		b	.L46
+ 643              	.L56:
+ 644 0066 00BF     		.align	2
+ 645              	.L55:
+ 646 0068 00000000 		.word	k230_to_stm32_pool
+ 647 006c 00000000 		.word	K230ToStm32OnRxData
+ 648              		.cfi_endproc
+ 649              	.LFE72:
+ 651              		.section	.text.K230ToStm32Start,"ax",%progbits
+ 652              		.align	1
+ 653              		.global	K230ToStm32Start
+ 654              		.syntax unified
+ 655              		.thumb
+ 656              		.thumb_func
+ 658              	K230ToStm32Start:
+ 659              	.LVL52:
+ 660              	.LFB73:
+ 259:modules/k230_to_stm32.c ****     if (instance == NULL) {
+ 661              		.loc 1 259 1 is_stmt 1 view -0
+ 662              		.cfi_startproc
+ 663              		@ args = 0, pretend = 0, frame = 0
+ 664              		@ frame_needed = 0, uses_anonymous_args = 0
+ 260:modules/k230_to_stm32.c ****         return 0u;
+ 665              		.loc 1 260 5 view .LVU183
+ 260:modules/k230_to_stm32.c ****         return 0u;
+ 666              		.loc 1 260 8 is_stmt 0 view .LVU184
+ 667 0000 30B1     		cbz	r0, .L59
+ 259:modules/k230_to_stm32.c ****     if (instance == NULL) {
+ 668              		.loc 1 259 1 view .LVU185
+ 669 0002 08B5     		push	{r3, lr}
+ 670              	.LCFI9:
+ 671              		.cfi_def_cfa_offset 8
+ 672              		.cfi_offset 3, -8
+ 673              		.cfi_offset 14, -4
+ 264:modules/k230_to_stm32.c **** }
+ 674              		.loc 1 264 5 is_stmt 1 view .LVU186
+ 264:modules/k230_to_stm32.c **** }
+ 675              		.loc 1 264 13 is_stmt 0 view .LVU187
+ 676 0004 0068     		ldr	r0, [r0]
+ 677              	.LVL53:
+ 264:modules/k230_to_stm32.c **** }
+ 678              		.loc 1 264 13 view .LVU188
+ 679 0006 FFF7FEFF 		bl	K230UsartStart
+ 680              	.LVL54:
+ 264:modules/k230_to_stm32.c **** }
+ 681              		.loc 1 264 70 discriminator 1 view .LVU189
+ 682 000a 18B9     		cbnz	r0, .L60
+ 683 000c 0120     		movs	r0, #1
+ 684              	.L58:
+ 265:modules/k230_to_stm32.c **** 
+ 685              		.loc 1 265 1 view .LVU190
+ 686 000e 08BD     		pop	{r3, pc}
+ 687              	.LVL55:
+ 688              	.L59:
+ 689              	.LCFI10:
+ 690              		.cfi_def_cfa_offset 0
+ 691              		.cfi_restore 3
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 20
+
+
+ 692              		.cfi_restore 14
+ 261:modules/k230_to_stm32.c ****     }
+ 693              		.loc 1 261 16 view .LVU191
+ 694 0010 0020     		movs	r0, #0
+ 695              	.LVL56:
+ 265:modules/k230_to_stm32.c **** 
+ 696              		.loc 1 265 1 view .LVU192
+ 697 0012 7047     		bx	lr
+ 698              	.L60:
+ 699              	.LCFI11:
+ 700              		.cfi_def_cfa_offset 8
+ 701              		.cfi_offset 3, -8
+ 702              		.cfi_offset 14, -4
+ 264:modules/k230_to_stm32.c **** }
+ 703              		.loc 1 264 70 discriminator 2 view .LVU193
+ 704 0014 0020     		movs	r0, #0
+ 705 0016 FAE7     		b	.L58
+ 706              		.cfi_endproc
+ 707              	.LFE73:
+ 709              		.section	.text.k230_to_stm32_Init,"ax",%progbits
+ 710              		.align	1
+ 711              		.global	k230_to_stm32_Init
+ 712              		.syntax unified
+ 713              		.thumb
+ 714              		.thumb_func
+ 716              	k230_to_stm32_Init:
+ 717              	.LVL57:
+ 718              	.LFB70:
+ 198:modules/k230_to_stm32.c ****     K230ToStm32_Init_Config_s config = {
+ 719              		.loc 1 198 1 is_stmt 1 view -0
+ 720              		.cfi_startproc
+ 721              		@ args = 0, pretend = 0, frame = 8
+ 722              		@ frame_needed = 0, uses_anonymous_args = 0
+ 198:modules/k230_to_stm32.c ****     K230ToStm32_Init_Config_s config = {
+ 723              		.loc 1 198 1 is_stmt 0 view .LVU195
+ 724 0000 00B5     		push	{lr}
+ 725              	.LCFI12:
+ 726              		.cfi_def_cfa_offset 4
+ 727              		.cfi_offset 14, -4
+ 728 0002 83B0     		sub	sp, sp, #12
+ 729              	.LCFI13:
+ 730              		.cfi_def_cfa_offset 16
+ 199:modules/k230_to_stm32.c ****         .uart_handle = uart_handle,
+ 731              		.loc 1 199 5 is_stmt 1 view .LVU196
+ 199:modules/k230_to_stm32.c ****         .uart_handle = uart_handle,
+ 732              		.loc 1 199 31 is_stmt 0 view .LVU197
+ 733 0004 0190     		str	r0, [sp, #4]
+ 204:modules/k230_to_stm32.c ****     if (k230_to_stm32_instance == NULL) {
+ 734              		.loc 1 204 5 is_stmt 1 view .LVU198
+ 204:modules/k230_to_stm32.c ****     if (k230_to_stm32_instance == NULL) {
+ 735              		.loc 1 204 30 is_stmt 0 view .LVU199
+ 736 0006 01A8     		add	r0, sp, #4
+ 737              	.LVL58:
+ 204:modules/k230_to_stm32.c ****     if (k230_to_stm32_instance == NULL) {
+ 738              		.loc 1 204 30 view .LVU200
+ 739 0008 FFF7FEFF 		bl	K230ToStm32Register
+ 740              	.LVL59:
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 21
+
+
+ 204:modules/k230_to_stm32.c ****     if (k230_to_stm32_instance == NULL) {
+ 741              		.loc 1 204 28 discriminator 1 view .LVU201
+ 742 000c 044B     		ldr	r3, .L69
+ 743 000e 1860     		str	r0, [r3]
+ 205:modules/k230_to_stm32.c ****         return 0u;
+ 744              		.loc 1 205 5 is_stmt 1 view .LVU202
+ 205:modules/k230_to_stm32.c ****         return 0u;
+ 745              		.loc 1 205 8 is_stmt 0 view .LVU203
+ 746 0010 20B1     		cbz	r0, .L67
+ 209:modules/k230_to_stm32.c **** }
+ 747              		.loc 1 209 5 is_stmt 1 view .LVU204
+ 209:modules/k230_to_stm32.c **** }
+ 748              		.loc 1 209 12 is_stmt 0 view .LVU205
+ 749 0012 FFF7FEFF 		bl	K230ToStm32Start
+ 750              	.LVL60:
+ 751              	.L66:
+ 210:modules/k230_to_stm32.c **** 
+ 752              		.loc 1 210 1 view .LVU206
+ 753 0016 03B0     		add	sp, sp, #12
+ 754              	.LCFI14:
+ 755              		.cfi_remember_state
+ 756              		.cfi_def_cfa_offset 4
+ 757              		@ sp needed
+ 758 0018 5DF804FB 		ldr	pc, [sp], #4
+ 759              	.L67:
+ 760              	.LCFI15:
+ 761              		.cfi_restore_state
+ 206:modules/k230_to_stm32.c ****     }
+ 762              		.loc 1 206 16 view .LVU207
+ 763 001c 0020     		movs	r0, #0
+ 764 001e FAE7     		b	.L66
+ 765              	.L70:
+ 766              		.align	2
+ 767              	.L69:
+ 768 0020 00000000 		.word	k230_to_stm32_instance
+ 769              		.cfi_endproc
+ 770              	.LFE70:
+ 772              		.section	.text.K230ToStm32GetData,"ax",%progbits
+ 773              		.align	1
+ 774              		.global	K230ToStm32GetData
+ 775              		.syntax unified
+ 776              		.thumb
+ 777              		.thumb_func
+ 779              	K230ToStm32GetData:
+ 780              	.LVL61:
+ 781              	.LFB75:
+ 285:modules/k230_to_stm32.c **** 
+ 286:modules/k230_to_stm32.c **** uint8_t K230ToStm32GetData(K230ToStm32Instance *instance, K230_Data_s *data_out)
+ 287:modules/k230_to_stm32.c **** {
+ 782              		.loc 1 287 1 is_stmt 1 view -0
+ 783              		.cfi_startproc
+ 784              		@ args = 0, pretend = 0, frame = 0
+ 785              		@ frame_needed = 0, uses_anonymous_args = 0
+ 288:modules/k230_to_stm32.c ****     if ((instance == NULL) || (data_out == NULL)) {
+ 786              		.loc 1 288 5 view .LVU209
+ 787              		.loc 1 288 8 is_stmt 0 view .LVU210
+ 788 0000 C0B1     		cbz	r0, .L74
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 22
+
+
+ 287:modules/k230_to_stm32.c ****     if ((instance == NULL) || (data_out == NULL)) {
+ 789              		.loc 1 287 1 view .LVU211
+ 790 0002 10B5     		push	{r4, lr}
+ 791              	.LCFI16:
+ 792              		.cfi_def_cfa_offset 8
+ 793              		.cfi_offset 4, -8
+ 794              		.cfi_offset 14, -4
+ 795 0004 0C46     		mov	r4, r1
+ 796 0006 8446     		mov	ip, r0
+ 797              		.loc 1 288 28 discriminator 1 view .LVU212
+ 798 0008 B1B1     		cbz	r1, .L75
+ 289:modules/k230_to_stm32.c ****         return 0u;
+ 290:modules/k230_to_stm32.c ****     }
+ 291:modules/k230_to_stm32.c **** 
+ 292:modules/k230_to_stm32.c ****     /* 单写(中断)多读(主循环)：读取期间关中断，避免拷到半新半旧的快照�
+ 293:modules/k230_to_stm32.c ****        临界区内只有一次结构体赋值，无延时（开发规范 §8.2） */
+ 294:modules/k230_to_stm32.c ****     uint32_t primask = __get_PRIMASK();
+ 799              		.loc 1 294 5 is_stmt 1 view .LVU213
+ 800              	.LBB13:
+ 801              	.LBI13:
+ 802              		.file 2 "Drivers/CMSIS/Include/cmsis_gcc.h"
+   1:Drivers/CMSIS/Include/cmsis_gcc.h **** /**************************************************************************//**
+   2:Drivers/CMSIS/Include/cmsis_gcc.h ****  * @file     cmsis_gcc.h
+   3:Drivers/CMSIS/Include/cmsis_gcc.h ****  * @brief    CMSIS compiler GCC header file
+   4:Drivers/CMSIS/Include/cmsis_gcc.h ****  * @version  V5.0.4
+   5:Drivers/CMSIS/Include/cmsis_gcc.h ****  * @date     09. April 2018
+   6:Drivers/CMSIS/Include/cmsis_gcc.h ****  ******************************************************************************/
+   7:Drivers/CMSIS/Include/cmsis_gcc.h **** /*
+   8:Drivers/CMSIS/Include/cmsis_gcc.h ****  * Copyright (c) 2009-2018 Arm Limited. All rights reserved.
+   9:Drivers/CMSIS/Include/cmsis_gcc.h ****  *
+  10:Drivers/CMSIS/Include/cmsis_gcc.h ****  * SPDX-License-Identifier: Apache-2.0
+  11:Drivers/CMSIS/Include/cmsis_gcc.h ****  *
+  12:Drivers/CMSIS/Include/cmsis_gcc.h ****  * Licensed under the Apache License, Version 2.0 (the License); you may
+  13:Drivers/CMSIS/Include/cmsis_gcc.h ****  * not use this file except in compliance with the License.
+  14:Drivers/CMSIS/Include/cmsis_gcc.h ****  * You may obtain a copy of the License at
+  15:Drivers/CMSIS/Include/cmsis_gcc.h ****  *
+  16:Drivers/CMSIS/Include/cmsis_gcc.h ****  * www.apache.org/licenses/LICENSE-2.0
+  17:Drivers/CMSIS/Include/cmsis_gcc.h ****  *
+  18:Drivers/CMSIS/Include/cmsis_gcc.h ****  * Unless required by applicable law or agreed to in writing, software
+  19:Drivers/CMSIS/Include/cmsis_gcc.h ****  * distributed under the License is distributed on an AS IS BASIS, WITHOUT
+  20:Drivers/CMSIS/Include/cmsis_gcc.h ****  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  21:Drivers/CMSIS/Include/cmsis_gcc.h ****  * See the License for the specific language governing permissions and
+  22:Drivers/CMSIS/Include/cmsis_gcc.h ****  * limitations under the License.
+  23:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+  24:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+  25:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef __CMSIS_GCC_H
+  26:Drivers/CMSIS/Include/cmsis_gcc.h **** #define __CMSIS_GCC_H
+  27:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+  28:Drivers/CMSIS/Include/cmsis_gcc.h **** /* ignore some GCC warnings */
+  29:Drivers/CMSIS/Include/cmsis_gcc.h **** #pragma GCC diagnostic push
+  30:Drivers/CMSIS/Include/cmsis_gcc.h **** #pragma GCC diagnostic ignored "-Wsign-conversion"
+  31:Drivers/CMSIS/Include/cmsis_gcc.h **** #pragma GCC diagnostic ignored "-Wconversion"
+  32:Drivers/CMSIS/Include/cmsis_gcc.h **** #pragma GCC diagnostic ignored "-Wunused-parameter"
+  33:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+  34:Drivers/CMSIS/Include/cmsis_gcc.h **** /* Fallback for __has_builtin */
+  35:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef __has_builtin
+  36:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __has_builtin(x) (0)
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 23
+
+
+  37:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  38:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+  39:Drivers/CMSIS/Include/cmsis_gcc.h **** /* CMSIS compiler specific defines */
+  40:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __ASM
+  41:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __ASM                                  __asm
+  42:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  43:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __INLINE
+  44:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __INLINE                               inline
+  45:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  46:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __STATIC_INLINE
+  47:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __STATIC_INLINE                        static inline
+  48:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  49:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __STATIC_FORCEINLINE                 
+  50:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __STATIC_FORCEINLINE                   __attribute__((always_inline)) static inline
+  51:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif                                           
+  52:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __NO_RETURN
+  53:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __NO_RETURN                            __attribute__((__noreturn__))
+  54:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  55:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __USED
+  56:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __USED                                 __attribute__((used))
+  57:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  58:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __WEAK
+  59:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __WEAK                                 __attribute__((weak))
+  60:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  61:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __PACKED
+  62:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __PACKED                               __attribute__((packed, aligned(1)))
+  63:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  64:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __PACKED_STRUCT
+  65:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __PACKED_STRUCT                        struct __attribute__((packed, aligned(1)))
+  66:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  67:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __PACKED_UNION
+  68:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __PACKED_UNION                         union __attribute__((packed, aligned(1)))
+  69:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  70:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __UNALIGNED_UINT32        /* deprecated */
+  71:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic push
+  72:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wpacked"
+  73:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wattributes"
+  74:Drivers/CMSIS/Include/cmsis_gcc.h ****   struct __attribute__((packed)) T_UINT32 { uint32_t v; };
+  75:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic pop
+  76:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __UNALIGNED_UINT32(x)                  (((struct T_UINT32 *)(x))->v)
+  77:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  78:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __UNALIGNED_UINT16_WRITE
+  79:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic push
+  80:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wpacked"
+  81:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wattributes"
+  82:Drivers/CMSIS/Include/cmsis_gcc.h ****   __PACKED_STRUCT T_UINT16_WRITE { uint16_t v; };
+  83:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic pop
+  84:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __UNALIGNED_UINT16_WRITE(addr, val)    (void)((((struct T_UINT16_WRITE *)(void *)(addr))-
+  85:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+  86:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __UNALIGNED_UINT16_READ
+  87:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic push
+  88:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wpacked"
+  89:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wattributes"
+  90:Drivers/CMSIS/Include/cmsis_gcc.h ****   __PACKED_STRUCT T_UINT16_READ { uint16_t v; };
+  91:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic pop
+  92:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __UNALIGNED_UINT16_READ(addr)          (((const struct T_UINT16_READ *)(const void *)(add
+  93:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 24
+
+
+  94:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __UNALIGNED_UINT32_WRITE
+  95:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic push
+  96:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wpacked"
+  97:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wattributes"
+  98:Drivers/CMSIS/Include/cmsis_gcc.h ****   __PACKED_STRUCT T_UINT32_WRITE { uint32_t v; };
+  99:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic pop
+ 100:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __UNALIGNED_UINT32_WRITE(addr, val)    (void)((((struct T_UINT32_WRITE *)(void *)(addr))-
+ 101:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 102:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __UNALIGNED_UINT32_READ
+ 103:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic push
+ 104:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wpacked"
+ 105:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic ignored "-Wattributes"
+ 106:Drivers/CMSIS/Include/cmsis_gcc.h ****   __PACKED_STRUCT T_UINT32_READ { uint32_t v; };
+ 107:Drivers/CMSIS/Include/cmsis_gcc.h ****   #pragma GCC diagnostic pop
+ 108:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __UNALIGNED_UINT32_READ(addr)          (((const struct T_UINT32_READ *)(const void *)(add
+ 109:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 110:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __ALIGNED
+ 111:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __ALIGNED(x)                           __attribute__((aligned(x)))
+ 112:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 113:Drivers/CMSIS/Include/cmsis_gcc.h **** #ifndef   __RESTRICT
+ 114:Drivers/CMSIS/Include/cmsis_gcc.h ****   #define __RESTRICT                             __restrict
+ 115:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 116:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 117:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 118:Drivers/CMSIS/Include/cmsis_gcc.h **** /* ###########################  Core Function Access  ########################### */
+ 119:Drivers/CMSIS/Include/cmsis_gcc.h **** /** \ingroup  CMSIS_Core_FunctionInterface
+ 120:Drivers/CMSIS/Include/cmsis_gcc.h ****     \defgroup CMSIS_Core_RegAccFunctions CMSIS Core Register Access Functions
+ 121:Drivers/CMSIS/Include/cmsis_gcc.h ****   @{
+ 122:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 123:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 124:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 125:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Enable IRQ Interrupts
+ 126:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Enables IRQ interrupts by clearing the I-bit in the CPSR.
+ 127:Drivers/CMSIS/Include/cmsis_gcc.h ****            Can only be executed in Privileged modes.
+ 128:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 129:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __enable_irq(void)
+ 130:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 131:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("cpsie i" : : : "memory");
+ 132:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 133:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 134:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 135:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 136:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Disable IRQ Interrupts
+ 137:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Disables IRQ interrupts by setting the I-bit in the CPSR.
+ 138:Drivers/CMSIS/Include/cmsis_gcc.h ****            Can only be executed in Privileged modes.
+ 139:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 140:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __disable_irq(void)
+ 141:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 142:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("cpsid i" : : : "memory");
+ 143:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 144:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 145:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 146:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 147:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Control Register
+ 148:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the content of the Control Register.
+ 149:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               Control Register value
+ 150:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 25
+
+
+ 151:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __get_CONTROL(void)
+ 152:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 153:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 154:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 155:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, control" : "=r" (result) );
+ 156:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 157:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 158:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 159:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 160:Drivers/CMSIS/Include/cmsis_gcc.h **** #if (defined (__ARM_FEATURE_CMSE ) && (__ARM_FEATURE_CMSE == 3))
+ 161:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 162:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Control Register (non-secure)
+ 163:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the content of the non-secure Control Register when in secure mode.
+ 164:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               non-secure Control Register value
+ 165:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 166:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __TZ_get_CONTROL_NS(void)
+ 167:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 168:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 169:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 170:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, control_ns" : "=r" (result) );
+ 171:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 172:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 173:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 174:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 175:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 176:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 177:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Set Control Register
+ 178:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Writes the given value to the Control Register.
+ 179:Drivers/CMSIS/Include/cmsis_gcc.h ****   \param [in]    control  Control Register value to set
+ 180:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 181:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __set_CONTROL(uint32_t control)
+ 182:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 183:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MSR control, %0" : : "r" (control) : "memory");
+ 184:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 185:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 186:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 187:Drivers/CMSIS/Include/cmsis_gcc.h **** #if (defined (__ARM_FEATURE_CMSE ) && (__ARM_FEATURE_CMSE == 3))
+ 188:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 189:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Set Control Register (non-secure)
+ 190:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Writes the given value to the non-secure Control Register when in secure state.
+ 191:Drivers/CMSIS/Include/cmsis_gcc.h ****   \param [in]    control  Control Register value to set
+ 192:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 193:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __TZ_set_CONTROL_NS(uint32_t control)
+ 194:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 195:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MSR control_ns, %0" : : "r" (control) : "memory");
+ 196:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 197:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 198:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 199:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 200:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 201:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get IPSR Register
+ 202:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the content of the IPSR Register.
+ 203:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               IPSR Register value
+ 204:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 205:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __get_IPSR(void)
+ 206:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 207:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 26
+
+
+ 208:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 209:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, ipsr" : "=r" (result) );
+ 210:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 211:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 212:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 213:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 214:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 215:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get APSR Register
+ 216:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the content of the APSR Register.
+ 217:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               APSR Register value
+ 218:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 219:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __get_APSR(void)
+ 220:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 221:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 222:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 223:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, apsr" : "=r" (result) );
+ 224:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 225:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 226:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 227:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 228:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 229:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get xPSR Register
+ 230:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the content of the xPSR Register.
+ 231:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               xPSR Register value
+ 232:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 233:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __get_xPSR(void)
+ 234:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 235:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 236:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 237:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, xpsr" : "=r" (result) );
+ 238:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 239:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 240:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 241:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 242:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 243:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Process Stack Pointer
+ 244:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the current value of the Process Stack Pointer (PSP).
+ 245:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               PSP Register value
+ 246:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 247:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __get_PSP(void)
+ 248:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 249:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 250:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 251:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, psp"  : "=r" (result) );
+ 252:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 253:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 254:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 255:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 256:Drivers/CMSIS/Include/cmsis_gcc.h **** #if (defined (__ARM_FEATURE_CMSE ) && (__ARM_FEATURE_CMSE == 3))
+ 257:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 258:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Process Stack Pointer (non-secure)
+ 259:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the current value of the non-secure Process Stack Pointer (PSP) when in secure s
+ 260:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               PSP Register value
+ 261:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 262:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __TZ_get_PSP_NS(void)
+ 263:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 264:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 27
+
+
+ 265:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 266:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, psp_ns"  : "=r" (result) );
+ 267:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 268:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 269:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 270:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 271:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 272:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 273:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Set Process Stack Pointer
+ 274:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Assigns the given value to the Process Stack Pointer (PSP).
+ 275:Drivers/CMSIS/Include/cmsis_gcc.h ****   \param [in]    topOfProcStack  Process Stack Pointer value to set
+ 276:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 277:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __set_PSP(uint32_t topOfProcStack)
+ 278:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 279:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MSR psp, %0" : : "r" (topOfProcStack) : );
+ 280:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 281:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 282:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 283:Drivers/CMSIS/Include/cmsis_gcc.h **** #if (defined (__ARM_FEATURE_CMSE ) && (__ARM_FEATURE_CMSE == 3))
+ 284:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 285:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Set Process Stack Pointer (non-secure)
+ 286:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Assigns the given value to the non-secure Process Stack Pointer (PSP) when in secure sta
+ 287:Drivers/CMSIS/Include/cmsis_gcc.h ****   \param [in]    topOfProcStack  Process Stack Pointer value to set
+ 288:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 289:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __TZ_set_PSP_NS(uint32_t topOfProcStack)
+ 290:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 291:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MSR psp_ns, %0" : : "r" (topOfProcStack) : );
+ 292:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 293:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 294:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 295:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 296:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 297:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Main Stack Pointer
+ 298:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the current value of the Main Stack Pointer (MSP).
+ 299:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               MSP Register value
+ 300:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 301:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __get_MSP(void)
+ 302:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 303:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 304:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 305:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, msp" : "=r" (result) );
+ 306:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 307:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 308:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 309:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 310:Drivers/CMSIS/Include/cmsis_gcc.h **** #if (defined (__ARM_FEATURE_CMSE ) && (__ARM_FEATURE_CMSE == 3))
+ 311:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 312:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Main Stack Pointer (non-secure)
+ 313:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the current value of the non-secure Main Stack Pointer (MSP) when in secure stat
+ 314:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               MSP Register value
+ 315:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 316:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __TZ_get_MSP_NS(void)
+ 317:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 318:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 319:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 320:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, msp_ns" : "=r" (result) );
+ 321:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 28
+
+
+ 322:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 323:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 324:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 325:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 326:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 327:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Set Main Stack Pointer
+ 328:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Assigns the given value to the Main Stack Pointer (MSP).
+ 329:Drivers/CMSIS/Include/cmsis_gcc.h ****   \param [in]    topOfMainStack  Main Stack Pointer value to set
+ 330:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 331:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __set_MSP(uint32_t topOfMainStack)
+ 332:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 333:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MSR msp, %0" : : "r" (topOfMainStack) : );
+ 334:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 335:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 336:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 337:Drivers/CMSIS/Include/cmsis_gcc.h **** #if (defined (__ARM_FEATURE_CMSE ) && (__ARM_FEATURE_CMSE == 3))
+ 338:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 339:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Set Main Stack Pointer (non-secure)
+ 340:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Assigns the given value to the non-secure Main Stack Pointer (MSP) when in secure state.
+ 341:Drivers/CMSIS/Include/cmsis_gcc.h ****   \param [in]    topOfMainStack  Main Stack Pointer value to set
+ 342:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 343:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __TZ_set_MSP_NS(uint32_t topOfMainStack)
+ 344:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 345:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MSR msp_ns, %0" : : "r" (topOfMainStack) : );
+ 346:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 347:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 348:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 349:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 350:Drivers/CMSIS/Include/cmsis_gcc.h **** #if (defined (__ARM_FEATURE_CMSE ) && (__ARM_FEATURE_CMSE == 3))
+ 351:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 352:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Stack Pointer (non-secure)
+ 353:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the current value of the non-secure Stack Pointer (SP) when in secure state.
+ 354:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               SP Register value
+ 355:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 356:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __TZ_get_SP_NS(void)
+ 357:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 358:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 359:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 360:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, sp_ns" : "=r" (result) );
+ 361:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 362:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 363:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 364:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 365:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 366:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Set Stack Pointer (non-secure)
+ 367:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Assigns the given value to the non-secure Stack Pointer (SP) when in secure state.
+ 368:Drivers/CMSIS/Include/cmsis_gcc.h ****   \param [in]    topOfStack  Stack Pointer value to set
+ 369:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 370:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __TZ_set_SP_NS(uint32_t topOfStack)
+ 371:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 372:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MSR sp_ns, %0" : : "r" (topOfStack) : );
+ 373:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 374:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 375:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 376:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 377:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 378:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Priority Mask
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 29
+
+
+ 379:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the current state of the priority mask bit from the Priority Mask Register.
+ 380:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               Priority Mask value
+ 381:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 382:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __get_PRIMASK(void)
+ 803              		.loc 2 382 31 view .LVU214
+ 804              	.LBB14:
+ 383:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 384:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 805              		.loc 2 384 3 view .LVU215
+ 385:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 386:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, primask" : "=r" (result) :: "memory");
+ 806              		.loc 2 386 3 view .LVU216
+ 807              		.syntax unified
+ 808              	@ 386 "Drivers/CMSIS/Include/cmsis_gcc.h" 1
+ 809 000a EFF3108E 		MRS lr, primask
+ 810              	@ 0 "" 2
+ 811              	.LVL62:
+ 387:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 812              		.loc 2 387 3 view .LVU217
+ 813              		.loc 2 387 3 is_stmt 0 view .LVU218
+ 814              		.thumb
+ 815              		.syntax unified
+ 816              	.LBE14:
+ 817              	.LBE13:
+ 295:modules/k230_to_stm32.c ****     __disable_irq();
+ 818              		.loc 1 295 5 is_stmt 1 view .LVU219
+ 819              	.LBB15:
+ 820              	.LBI15:
+ 140:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 821              		.loc 2 140 27 view .LVU220
+ 822              	.LBB16:
+ 142:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 823              		.loc 2 142 3 view .LVU221
+ 824              		.syntax unified
+ 825              	@ 142 "Drivers/CMSIS/Include/cmsis_gcc.h" 1
+ 826 000e 72B6     		cpsid i
+ 827              	@ 0 "" 2
+ 828              		.thumb
+ 829              		.syntax unified
+ 830              	.LBE16:
+ 831              	.LBE15:
+ 296:modules/k230_to_stm32.c ****     *data_out = instance->data;
+ 832              		.loc 1 296 5 view .LVU222
+ 833              		.loc 1 296 15 is_stmt 0 view .LVU223
+ 834 0010 00F19403 		add	r3, r0, #148
+ 835 0014 0FCB     		ldm	r3, {r0, r1, r2, r3}
+ 836              	.LVL63:
+ 837              		.loc 1 296 15 view .LVU224
+ 838 0016 84E80F00 		stm	r4, {r0, r1, r2, r3}
+ 297:modules/k230_to_stm32.c ****     __set_PRIMASK(primask);
+ 839              		.loc 1 297 5 is_stmt 1 view .LVU225
+ 840              	.LVL64:
+ 841              	.LBB17:
+ 842              	.LBI17:
+ 388:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 389:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 390:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 30
+
+
+ 391:Drivers/CMSIS/Include/cmsis_gcc.h **** #if (defined (__ARM_FEATURE_CMSE ) && (__ARM_FEATURE_CMSE == 3))
+ 392:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 393:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Get Priority Mask (non-secure)
+ 394:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Returns the current state of the non-secure priority mask bit from the Priority Mask Reg
+ 395:Drivers/CMSIS/Include/cmsis_gcc.h ****   \return               Priority Mask value
+ 396:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 397:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE uint32_t __TZ_get_PRIMASK_NS(void)
+ 398:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 399:Drivers/CMSIS/Include/cmsis_gcc.h ****   uint32_t result;
+ 400:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 401:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MRS %0, primask_ns" : "=r" (result) :: "memory");
+ 402:Drivers/CMSIS/Include/cmsis_gcc.h ****   return(result);
+ 403:Drivers/CMSIS/Include/cmsis_gcc.h **** }
+ 404:Drivers/CMSIS/Include/cmsis_gcc.h **** #endif
+ 405:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 406:Drivers/CMSIS/Include/cmsis_gcc.h **** 
+ 407:Drivers/CMSIS/Include/cmsis_gcc.h **** /**
+ 408:Drivers/CMSIS/Include/cmsis_gcc.h ****   \brief   Set Priority Mask
+ 409:Drivers/CMSIS/Include/cmsis_gcc.h ****   \details Assigns the given value to the Priority Mask Register.
+ 410:Drivers/CMSIS/Include/cmsis_gcc.h ****   \param [in]    priMask  Priority Mask
+ 411:Drivers/CMSIS/Include/cmsis_gcc.h ****  */
+ 412:Drivers/CMSIS/Include/cmsis_gcc.h **** __STATIC_FORCEINLINE void __set_PRIMASK(uint32_t priMask)
+ 843              		.loc 2 412 27 view .LVU226
+ 844              	.LBB18:
+ 413:Drivers/CMSIS/Include/cmsis_gcc.h **** {
+ 414:Drivers/CMSIS/Include/cmsis_gcc.h ****   __ASM volatile ("MSR primask, %0" : : "r" (priMask) : "memory");
+ 845              		.loc 2 414 3 view .LVU227
+ 846              		.syntax unified
+ 847              	@ 414 "Drivers/CMSIS/Include/cmsis_gcc.h" 1
+ 848 001a 8EF31088 		MSR primask, lr
+ 849              	@ 0 "" 2
+ 850              	.LVL65:
+ 851              		.loc 2 414 3 is_stmt 0 view .LVU228
+ 852              		.thumb
+ 853              		.syntax unified
+ 854              	.LBE18:
+ 855              	.LBE17:
+ 298:modules/k230_to_stm32.c **** 
+ 299:modules/k230_to_stm32.c ****     /* 用快照自己的时间戳判在线，保证返回值与快照出自同一时刻 */
+ 300:modules/k230_to_stm32.c ****     if (K230ToStm32IsOnlineAt(instance->frame_count, data_out->last_frame_time_ms) == 0u) {
+ 856              		.loc 1 300 5 is_stmt 1 view .LVU229
+ 857              		.loc 1 300 39 is_stmt 0 view .LVU230
+ 858 001e DCF8A400 		ldr	r0, [ip, #164]
+ 859              		.loc 1 300 9 view .LVU231
+ 860 0022 E168     		ldr	r1, [r4, #12]
+ 861 0024 FFF7FEFF 		bl	K230ToStm32IsOnlineAt
+ 862              	.LVL66:
+ 863              		.loc 1 300 8 discriminator 1 view .LVU232
+ 864 0028 10B9     		cbnz	r0, .L73
+ 301:modules/k230_to_stm32.c ****         /* 链路超时后坐标不再可信：即使最后一帧仍检测到人，也必须把
+ 302:modules/k230_to_stm32.c ****            data_valid 清掉，否则控制环会拿着过期坐标闭环（规范 §12.1） */
+ 303:modules/k230_to_stm32.c ****         data_out->data_valid      = 0u;
+ 865              		.loc 1 303 9 is_stmt 1 view .LVU233
+ 866              		.loc 1 303 35 is_stmt 0 view .LVU234
+ 867 002a 0023     		movs	r3, #0
+ 868 002c 6372     		strb	r3, [r4, #9]
+ 304:modules/k230_to_stm32.c ****         data_out->target_detected = 0u;
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 31
+
+
+ 869              		.loc 1 304 9 is_stmt 1 view .LVU235
+ 870              		.loc 1 304 35 is_stmt 0 view .LVU236
+ 871 002e 2372     		strb	r3, [r4, #8]
+ 872              	.L73:
+ 305:modules/k230_to_stm32.c ****     }
+ 306:modules/k230_to_stm32.c **** 
+ 307:modules/k230_to_stm32.c ****     return data_out->data_valid;
+ 873              		.loc 1 307 5 is_stmt 1 view .LVU237
+ 874              		.loc 1 307 20 is_stmt 0 view .LVU238
+ 875 0030 607A     		ldrb	r0, [r4, #9]	@ zero_extendqisi2
+ 876              	.LVL67:
+ 877              	.L72:
+ 308:modules/k230_to_stm32.c **** }
+ 878              		.loc 1 308 1 view .LVU239
+ 879 0032 10BD     		pop	{r4, pc}
+ 880              	.LVL68:
+ 881              	.L74:
+ 882              	.LCFI17:
+ 883              		.cfi_def_cfa_offset 0
+ 884              		.cfi_restore 4
+ 885              		.cfi_restore 14
+ 289:modules/k230_to_stm32.c ****     }
+ 886              		.loc 1 289 16 view .LVU240
+ 887 0034 0020     		movs	r0, #0
+ 888              	.LVL69:
+ 889              		.loc 1 308 1 view .LVU241
+ 890 0036 7047     		bx	lr
+ 891              	.LVL70:
+ 892              	.L75:
+ 893              	.LCFI18:
+ 894              		.cfi_def_cfa_offset 8
+ 895              		.cfi_offset 4, -8
+ 896              		.cfi_offset 14, -4
+ 289:modules/k230_to_stm32.c ****     }
+ 897              		.loc 1 289 16 view .LVU242
+ 898 0038 0020     		movs	r0, #0
+ 899              	.LVL71:
+ 289:modules/k230_to_stm32.c ****     }
+ 900              		.loc 1 289 16 view .LVU243
+ 901 003a FAE7     		b	.L72
+ 902              		.cfi_endproc
+ 903              	.LFE75:
+ 905              		.section	.text.K230ToStm32IsOnline,"ax",%progbits
+ 906              		.align	1
+ 907              		.global	K230ToStm32IsOnline
+ 908              		.syntax unified
+ 909              		.thumb
+ 910              		.thumb_func
+ 912              	K230ToStm32IsOnline:
+ 913              	.LVL72:
+ 914              	.LFB76:
+ 309:modules/k230_to_stm32.c **** 
+ 310:modules/k230_to_stm32.c **** uint8_t K230ToStm32IsOnline(K230ToStm32Instance *instance)
+ 311:modules/k230_to_stm32.c **** {
+ 915              		.loc 1 311 1 is_stmt 1 view -0
+ 916              		.cfi_startproc
+ 917              		@ args = 0, pretend = 0, frame = 0
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 32
+
+
+ 918              		@ frame_needed = 0, uses_anonymous_args = 0
+ 312:modules/k230_to_stm32.c ****     if (instance == NULL) {
+ 919              		.loc 1 312 5 view .LVU245
+ 920              		.loc 1 312 8 is_stmt 0 view .LVU246
+ 921 0000 40B1     		cbz	r0, .L82
+ 311:modules/k230_to_stm32.c ****     if (instance == NULL) {
+ 922              		.loc 1 311 1 view .LVU247
+ 923 0002 08B5     		push	{r3, lr}
+ 924              	.LCFI19:
+ 925              		.cfi_def_cfa_offset 8
+ 926              		.cfi_offset 3, -8
+ 927              		.cfi_offset 14, -4
+ 928 0004 0346     		mov	r3, r0
+ 313:modules/k230_to_stm32.c ****         return 0u;
+ 314:modules/k230_to_stm32.c ****     }
+ 315:modules/k230_to_stm32.c **** 
+ 316:modules/k230_to_stm32.c ****     return K230ToStm32IsOnlineAt(instance->frame_count, instance->data.last_frame_time_ms);
+ 929              		.loc 1 316 5 is_stmt 1 view .LVU248
+ 930              		.loc 1 316 42 is_stmt 0 view .LVU249
+ 931 0006 D0F8A400 		ldr	r0, [r0, #164]
+ 932              	.LVL73:
+ 933              		.loc 1 316 71 view .LVU250
+ 934 000a D3F8A010 		ldr	r1, [r3, #160]
+ 935              		.loc 1 316 12 view .LVU251
+ 936 000e FFF7FEFF 		bl	K230ToStm32IsOnlineAt
+ 937              	.LVL74:
+ 317:modules/k230_to_stm32.c **** }
+ 938              		.loc 1 317 1 view .LVU252
+ 939 0012 08BD     		pop	{r3, pc}
+ 940              	.LVL75:
+ 941              	.L82:
+ 942              	.LCFI20:
+ 943              		.cfi_def_cfa_offset 0
+ 944              		.cfi_restore 3
+ 945              		.cfi_restore 14
+ 313:modules/k230_to_stm32.c ****         return 0u;
+ 946              		.loc 1 313 16 view .LVU253
+ 947 0014 0020     		movs	r0, #0
+ 948              	.LVL76:
+ 949              		.loc 1 317 1 view .LVU254
+ 950 0016 7047     		bx	lr
+ 951              		.cfi_endproc
+ 952              	.LFE76:
+ 954              		.section	.text.K230ToStm32GetStats,"ax",%progbits
+ 955              		.align	1
+ 956              		.global	K230ToStm32GetStats
+ 957              		.syntax unified
+ 958              		.thumb
+ 959              		.thumb_func
+ 961              	K230ToStm32GetStats:
+ 962              	.LVL77:
+ 963              	.LFB77:
+ 318:modules/k230_to_stm32.c **** 
+ 319:modules/k230_to_stm32.c **** void K230ToStm32GetStats(K230ToStm32Instance *instance, K230ToStm32_Stats_s *stats_out)
+ 320:modules/k230_to_stm32.c **** {
+ 964              		.loc 1 320 1 is_stmt 1 view -0
+ 965              		.cfi_startproc
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 33
+
+
+ 966              		@ args = 0, pretend = 0, frame = 0
+ 967              		@ frame_needed = 0, uses_anonymous_args = 0
+ 968              		@ link register save eliminated.
+ 321:modules/k230_to_stm32.c ****     if ((instance == NULL) || (stats_out == NULL)) {
+ 969              		.loc 1 321 5 view .LVU256
+ 970              		.loc 1 321 8 is_stmt 0 view .LVU257
+ 971 0000 48B1     		cbz	r0, .L87
+ 972              		.loc 1 321 28 discriminator 1 view .LVU258
+ 973 0002 41B1     		cbz	r1, .L87
+ 322:modules/k230_to_stm32.c ****         return;
+ 323:modules/k230_to_stm32.c ****     }
+ 324:modules/k230_to_stm32.c **** 
+ 325:modules/k230_to_stm32.c ****     stats_out->frame_count          = instance->frame_count;
+ 974              		.loc 1 325 5 is_stmt 1 view .LVU259
+ 975              		.loc 1 325 47 is_stmt 0 view .LVU260
+ 976 0004 D0F8A420 		ldr	r2, [r0, #164]
+ 977              		.loc 1 325 37 view .LVU261
+ 978 0008 0A60     		str	r2, [r1]
+ 326:modules/k230_to_stm32.c ****     stats_out->checksum_error_count = instance->checksum_error_count;
+ 979              		.loc 1 326 5 is_stmt 1 view .LVU262
+ 980              		.loc 1 326 47 is_stmt 0 view .LVU263
+ 981 000a D0F8A820 		ldr	r2, [r0, #168]
+ 982              		.loc 1 326 37 view .LVU264
+ 983 000e 4A60     		str	r2, [r1, #4]
+ 327:modules/k230_to_stm32.c ****     stats_out->lost_frame_count     = instance->lost_frame_count;
+ 984              		.loc 1 327 5 is_stmt 1 view .LVU265
+ 985              		.loc 1 327 47 is_stmt 0 view .LVU266
+ 986 0010 D0F8AC30 		ldr	r3, [r0, #172]
+ 987              		.loc 1 327 37 view .LVU267
+ 988 0014 8B60     		str	r3, [r1, #8]
+ 989              	.L87:
+ 328:modules/k230_to_stm32.c **** }
+ 990              		.loc 1 328 1 view .LVU268
+ 991 0016 7047     		bx	lr
+ 992              		.cfi_endproc
+ 993              	.LFE77:
+ 995              		.section	.bss.k230_to_stm32_instance,"aw",%nobits
+ 996              		.align	2
+ 999              	k230_to_stm32_instance:
+ 1000 0000 00000000 		.space	4
+ 1001              		.section	.bss.k230_to_stm32_pool,"aw",%nobits
+ 1002              		.align	2
+ 1005              	k230_to_stm32_pool:
+ 1006 0000 00000000 		.space	176
+ 1006      00000000 
+ 1006      00000000 
+ 1006      00000000 
+ 1006      00000000 
+ 1007              		.section	.rodata.k230_frame_header,"a"
+ 1008              		.align	2
+ 1011              	k230_frame_header:
+ 1012 0000 AA550108 		.ascii	"\252U\001\010"
+ 1013              		.text
+ 1014              	.Letext0:
+ 1015              		.file 3 "D:/BaiduNetdiskDownload/vscode_download/all_in_one/stm32tools/arm-none-eabi-gcc/14.2.1-1.
+ 1016              		.file 4 "D:/BaiduNetdiskDownload/vscode_download/all_in_one/stm32tools/arm-none-eabi-gcc/14.2.1-1.
+ 1017              		.file 5 "Drivers/CMSIS/Device/ST/STM32F1xx/Include/stm32f103xb.h"
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 34
+
+
+ 1018              		.file 6 "Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_def.h"
+ 1019              		.file 7 "Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_dma.h"
+ 1020              		.file 8 "Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h"
+ 1021              		.file 9 "bsp/usart/usart_k230.h"
+ 1022              		.file 10 "modules/k230_to_stm32.h"
+ 1023              		.file 11 "D:/BaiduNetdiskDownload/vscode_download/all_in_one/stm32tools/arm-none-eabi-gcc/14.2.1-1
+ 1024              		.file 12 "Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal.h"
+ 1025              		.file 13 "<built-in>"
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s 			page 35
+
+
+DEFINED SYMBOLS
+                            *ABS*:00000000 k230_to_stm32.c
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:19     .text.K230ToStm32ReadInt16BE:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:24     .text.K230ToStm32ReadInt16BE:00000000 K230ToStm32ReadInt16BE
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:47     .text.K230ToStm32IsCoordValid:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:52     .text.K230ToStm32IsCoordValid:00000000 K230ToStm32IsCoordValid
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:99     .text.K230ToStm32HandleFrame:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:104    .text.K230ToStm32HandleFrame:00000000 K230ToStm32HandleFrame
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:257    .text.K230ToStm32FeedByte:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:262    .text.K230ToStm32FeedByte:00000000 K230ToStm32FeedByte
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:347    .text.K230ToStm32FeedByte:00000044 $d
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:1011   .rodata.k230_frame_header:00000000 k230_frame_header
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:352    .text.K230ToStm32OnRxData:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:357    .text.K230ToStm32OnRxData:00000000 K230ToStm32OnRxData
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:433    .text.K230ToStm32IsOnlineAt:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:438    .text.K230ToStm32IsOnlineAt:00000000 K230ToStm32IsOnlineAt
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:490    .text.K230ToStm32GetInstance:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:496    .text.K230ToStm32GetInstance:00000000 K230ToStm32GetInstance
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:511    .text.K230ToStm32GetInstance:00000008 $d
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:999    .bss.k230_to_stm32_instance:00000000 k230_to_stm32_instance
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:516    .text.K230ToStm32Register:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:522    .text.K230ToStm32Register:00000000 K230ToStm32Register
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:646    .text.K230ToStm32Register:00000068 $d
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:1005   .bss.k230_to_stm32_pool:00000000 k230_to_stm32_pool
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:652    .text.K230ToStm32Start:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:658    .text.K230ToStm32Start:00000000 K230ToStm32Start
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:710    .text.k230_to_stm32_Init:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:716    .text.k230_to_stm32_Init:00000000 k230_to_stm32_Init
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:768    .text.k230_to_stm32_Init:00000020 $d
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:773    .text.K230ToStm32GetData:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:779    .text.K230ToStm32GetData:00000000 K230ToStm32GetData
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:906    .text.K230ToStm32IsOnline:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:912    .text.K230ToStm32IsOnline:00000000 K230ToStm32IsOnline
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:955    .text.K230ToStm32GetStats:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:961    .text.K230ToStm32GetStats:00000000 K230ToStm32GetStats
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:996    .bss.k230_to_stm32_instance:00000000 $d
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:1002   .bss.k230_to_stm32_pool:00000000 $d
+C:\Users\LJH\AppData\Local\Temp\ccPumTYf.s:1008   .rodata.k230_frame_header:00000000 $d
+
+UNDEFINED SYMBOLS
+HAL_GetTick
+memset
+K230UsartRegister
+K230UsartStart

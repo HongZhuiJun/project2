@@ -1,0 +1,325 @@
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s 			page 1
+
+
+   1              		.cpu cortex-m3
+   2              		.arch armv7-m
+   3              		.fpu softvfp
+   4              		.eabi_attribute 20, 1
+   5              		.eabi_attribute 21, 1
+   6              		.eabi_attribute 23, 3
+   7              		.eabi_attribute 24, 1
+   8              		.eabi_attribute 25, 1
+   9              		.eabi_attribute 26, 1
+  10              		.eabi_attribute 30, 1
+  11              		.eabi_attribute 34, 1
+  12              		.eabi_attribute 18, 4
+  13              		.file	"delay.c"
+  14              		.text
+  15              	.Ltext0:
+  16              		.cfi_sections	.debug_frame
+  17              		.file 1 "bsp/delay.c"
+  18              		.section	.text.delay_init,"ax",%progbits
+  19              		.align	1
+  20              		.global	delay_init
+  21              		.syntax unified
+  22              		.thumb
+  23              		.thumb_func
+  25              	delay_init:
+  26              	.LFB65:
+   1:bsp/delay.c   **** #include "delay.h"
+   2:bsp/delay.c   **** 
+   3:bsp/delay.c   **** // DWT 控制寄存器和计数寄存器地址（Cortex-M内核通用）
+   4:bsp/delay.c   **** #define DWT_CTRL   (*(volatile uint32_t *)0xE0001000UL)
+   5:bsp/delay.c   **** #define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004UL)
+   6:bsp/delay.c   **** #define DEMCR      (*(volatile uint32_t *)0xE000EDFCUL)
+   7:bsp/delay.c   **** 
+   8:bsp/delay.c   **** #define DEMCR_TRCENA_BIT (1UL << 24)  // 跟踪使能位
+   9:bsp/delay.c   **** #define DWT_CTRL_CYCCNTENA_BIT (1UL << 0) // 周期计数器使能位
+  10:bsp/delay.c   **** 
+  11:bsp/delay.c   **** static uint32_t us_ticks = 0; // 每微秒对应的CPU周期数
+  12:bsp/delay.c   **** 
+  13:bsp/delay.c   **** /**
+  14:bsp/delay.c   ****  * @brief   初始化DWT微秒延时计数器
+  15:bsp/delay.c   ****  * @note    必须在系统时钟初始化完成后调用，且只需调用一次
+  16:bsp/delay.c   ****  * @retval  无
+  17:bsp/delay.c   ****  */
+  18:bsp/delay.c   **** void delay_init(void)
+  19:bsp/delay.c   **** {
+  27              		.loc 1 19 1 view -0
+  28              		.cfi_startproc
+  29              		@ args = 0, pretend = 0, frame = 0
+  30              		@ frame_needed = 0, uses_anonymous_args = 0
+  31 0000 08B5     		push	{r3, lr}
+  32              		.cfi_def_cfa_offset 8
+  33              		.cfi_offset 3, -8
+  34              		.cfi_offset 14, -4
+  20:bsp/delay.c   ****     // 1. 使能 DWT 跟踪（解锁调试组件）
+  21:bsp/delay.c   ****     if (!(DEMCR & DEMCR_TRCENA_BIT)) {
+  35              		.loc 1 21 5 view .LVU1
+  36              		.loc 1 21 11 is_stmt 0 view .LVU2
+  37 0002 4FF0E023 		mov	r3, #-536813568
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s 			page 2
+
+
+  38 0006 D3F8FC3D 		ldr	r3, [r3, #3580]
+  39              		.loc 1 21 8 view .LVU3
+  40 000a 13F0807F 		tst	r3, #16777216
+  41 000e 07D1     		bne	.L2
+  22:bsp/delay.c   ****         DEMCR |= DEMCR_TRCENA_BIT;
+  42              		.loc 1 22 9 is_stmt 1 view .LVU4
+  43 0010 4FF0E022 		mov	r2, #-536813568
+  44 0014 D2F8FC3D 		ldr	r3, [r2, #3580]
+  45              		.loc 1 22 15 is_stmt 0 view .LVU5
+  46 0018 43F08073 		orr	r3, r3, #16777216
+  47 001c C2F8FC3D 		str	r3, [r2, #3580]
+  48              	.L2:
+  23:bsp/delay.c   ****     }
+  24:bsp/delay.c   ****     
+  25:bsp/delay.c   ****     // 2. 复位 CYCCNT 计数器（可选）
+  26:bsp/delay.c   ****     DWT_CYCCNT = 0;
+  49              		.loc 1 26 5 is_stmt 1 view .LVU6
+  50              		.loc 1 26 16 is_stmt 0 view .LVU7
+  51 0020 0A4B     		ldr	r3, .L5
+  52 0022 0022     		movs	r2, #0
+  53 0024 5A60     		str	r2, [r3, #4]
+  27:bsp/delay.c   ****     
+  28:bsp/delay.c   ****     // 3. 使能 CYCCNT 周期计数器
+  29:bsp/delay.c   ****     if (!(DWT_CTRL & DWT_CTRL_CYCCNTENA_BIT)) {
+  54              		.loc 1 29 5 is_stmt 1 view .LVU8
+  55              		.loc 1 29 11 is_stmt 0 view .LVU9
+  56 0026 1B68     		ldr	r3, [r3]
+  57              		.loc 1 29 8 view .LVU10
+  58 0028 13F0010F 		tst	r3, #1
+  59 002c 04D1     		bne	.L3
+  30:bsp/delay.c   ****         DWT_CTRL |= DWT_CTRL_CYCCNTENA_BIT;
+  60              		.loc 1 30 9 is_stmt 1 view .LVU11
+  61 002e 074A     		ldr	r2, .L5
+  62 0030 1368     		ldr	r3, [r2]
+  63              		.loc 1 30 18 is_stmt 0 view .LVU12
+  64 0032 43F00103 		orr	r3, r3, #1
+  65 0036 1360     		str	r3, [r2]
+  66              	.L3:
+  31:bsp/delay.c   ****     }
+  32:bsp/delay.c   ****     
+  33:bsp/delay.c   ****     // 4. 计算每微秒的CPU周期数（例如：168MHz主频则 us_ticks = 168）
+  34:bsp/delay.c   ****     us_ticks = HAL_RCC_GetHCLKFreq() / 1000000UL;
+  67              		.loc 1 34 5 is_stmt 1 view .LVU13
+  68              		.loc 1 34 16 is_stmt 0 view .LVU14
+  69 0038 FFF7FEFF 		bl	HAL_RCC_GetHCLKFreq
+  70              	.LVL0:
+  71              		.loc 1 34 38 discriminator 1 view .LVU15
+  72 003c 044B     		ldr	r3, .L5+4
+  73 003e A3FB0030 		umull	r3, r0, r3, r0
+  74 0042 800C     		lsrs	r0, r0, #18
+  75              		.loc 1 34 14 discriminator 1 view .LVU16
+  76 0044 034B     		ldr	r3, .L5+8
+  77 0046 1860     		str	r0, [r3]
+  35:bsp/delay.c   **** }
+  78              		.loc 1 35 1 view .LVU17
+  79 0048 08BD     		pop	{r3, pc}
+  80              	.L6:
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s 			page 3
+
+
+  81 004a 00BF     		.align	2
+  82              	.L5:
+  83 004c 001000E0 		.word	-536866816
+  84 0050 83DE1B43 		.word	1125899907
+  85 0054 00000000 		.word	us_ticks
+  86              		.cfi_endproc
+  87              	.LFE65:
+  89              		.section	.text.delay_ms,"ax",%progbits
+  90              		.align	1
+  91              		.global	delay_ms
+  92              		.syntax unified
+  93              		.thumb
+  94              		.thumb_func
+  96              	delay_ms:
+  97              	.LVL1:
+  98              	.LFB66:
+  36:bsp/delay.c   **** 
+  37:bsp/delay.c   **** /**
+  38:bsp/delay.c   ****  * @brief   毫秒级延时（直接复用HAL库的HAL_Delay）
+  39:bsp/delay.c   ****  * @param   ms: 延时毫秒数
+  40:bsp/delay.c   ****  * @retval  无
+  41:bsp/delay.c   ****  */
+  42:bsp/delay.c   **** void delay_ms(uint32_t ms)
+  43:bsp/delay.c   **** {
+  99              		.loc 1 43 1 is_stmt 1 view -0
+ 100              		.cfi_startproc
+ 101              		@ args = 0, pretend = 0, frame = 0
+ 102              		@ frame_needed = 0, uses_anonymous_args = 0
+ 103              		.loc 1 43 1 is_stmt 0 view .LVU19
+ 104 0000 08B5     		push	{r3, lr}
+ 105              		.cfi_def_cfa_offset 8
+ 106              		.cfi_offset 3, -8
+ 107              		.cfi_offset 14, -4
+  44:bsp/delay.c   ****     HAL_Delay(ms);
+ 108              		.loc 1 44 5 is_stmt 1 view .LVU20
+ 109 0002 FFF7FEFF 		bl	HAL_Delay
+ 110              	.LVL2:
+  45:bsp/delay.c   **** }
+ 111              		.loc 1 45 1 is_stmt 0 view .LVU21
+ 112 0006 08BD     		pop	{r3, pc}
+ 113              		.cfi_endproc
+ 114              	.LFE66:
+ 116              		.section	.text.delay_us,"ax",%progbits
+ 117              		.align	1
+ 118              		.global	delay_us
+ 119              		.syntax unified
+ 120              		.thumb
+ 121              		.thumb_func
+ 123              	delay_us:
+ 124              	.LVL3:
+ 125              	.LFB67:
+  46:bsp/delay.c   **** 
+  47:bsp/delay.c   **** /**
+  48:bsp/delay.c   ****  * @brief   微秒级延时（阻塞式忙等待，基于DWT周期计数器）
+  49:bsp/delay.c   ****  * @param   us: 延时微秒数（最大限制取决于主频，主频168MHz时最大约25秒）
+  50:bsp/delay.c   ****  * @note    不占用任何外设定时器资源，精度为1个CPU周期
+  51:bsp/delay.c   ****  * @retval  无
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s 			page 4
+
+
+  52:bsp/delay.c   ****  */
+  53:bsp/delay.c   **** void delay_us(uint32_t us)
+  54:bsp/delay.c   **** {
+ 126              		.loc 1 54 1 is_stmt 1 view -0
+ 127              		.cfi_startproc
+ 128              		@ args = 0, pretend = 0, frame = 0
+ 129              		@ frame_needed = 0, uses_anonymous_args = 0
+ 130              		.loc 1 54 1 is_stmt 0 view .LVU23
+ 131 0000 10B5     		push	{r4, lr}
+ 132              		.cfi_def_cfa_offset 8
+ 133              		.cfi_offset 4, -8
+ 134              		.cfi_offset 14, -4
+ 135 0002 0446     		mov	r4, r0
+  55:bsp/delay.c   ****     // 如果未初始化，自动调用初始化（确保安全）
+  56:bsp/delay.c   ****     if (us_ticks == 0) {
+ 136              		.loc 1 56 5 is_stmt 1 view .LVU24
+ 137              		.loc 1 56 18 is_stmt 0 view .LVU25
+ 138 0004 0D4B     		ldr	r3, .L17
+ 139 0006 1B68     		ldr	r3, [r3]
+ 140              		.loc 1 56 8 view .LVU26
+ 141 0008 83B1     		cbz	r3, .L16
+ 142              	.LVL4:
+ 143              	.L10:
+  57:bsp/delay.c   ****         delay_init();
+  58:bsp/delay.c   ****     }
+  59:bsp/delay.c   **** 
+  60:bsp/delay.c   ****     // 计算目标结束时的计数值 (使用64位防止溢出，但us不大时32位足够)
+  61:bsp/delay.c   ****     uint32_t start_ticks = DWT_CYCCNT;
+ 144              		.loc 1 61 5 is_stmt 1 view .LVU27
+ 145              		.loc 1 61 14 is_stmt 0 view .LVU28
+ 146 000a 0D4B     		ldr	r3, .L17+4
+ 147 000c 5A68     		ldr	r2, [r3, #4]
+ 148              	.LVL5:
+  62:bsp/delay.c   ****     uint32_t wait_ticks = us * us_ticks; 
+ 149              		.loc 1 62 5 is_stmt 1 view .LVU29
+ 150              		.loc 1 62 30 is_stmt 0 view .LVU30
+ 151 000e 0B4B     		ldr	r3, .L17
+ 152 0010 1868     		ldr	r0, [r3]
+ 153              	.LVL6:
+  63:bsp/delay.c   ****     uint32_t end_ticks = start_ticks + wait_ticks;
+ 154              		.loc 1 63 5 is_stmt 1 view .LVU31
+ 155              		.loc 1 63 14 is_stmt 0 view .LVU32
+ 156 0012 04FB0020 		mla	r0, r4, r0, r2
+ 157              	.LVL7:
+  64:bsp/delay.c   **** 
+  65:bsp/delay.c   ****     // 处理 CYCCNT 计数溢出（32位计数器回绕）
+  66:bsp/delay.c   ****     if (end_ticks < start_ticks) { 
+ 158              		.loc 1 66 5 is_stmt 1 view .LVU33
+ 159              		.loc 1 66 8 is_stmt 0 view .LVU34
+ 160 0016 8242     		cmp	r2, r0
+ 161 0018 0BD9     		bls	.L11
+ 162              	.LVL8:
+ 163              	.L12:
+  67:bsp/delay.c   ****         // 如果发生了32位溢出，分两段等待
+  68:bsp/delay.c   ****         while (DWT_CYCCNT >= start_ticks); // 等待直到计数器溢出回0
+ 164              		.loc 1 68 27 is_stmt 1 discriminator 1 view .LVU35
+ 165              		.loc 1 68 16 is_stmt 0 discriminator 1 view .LVU36
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s 			page 5
+
+
+ 166 001a 094B     		ldr	r3, .L17+4
+ 167 001c 5B68     		ldr	r3, [r3, #4]
+ 168              		.loc 1 68 27 discriminator 1 view .LVU37
+ 169 001e 9342     		cmp	r3, r2
+ 170 0020 FBD2     		bcs	.L12
+ 171              	.L13:
+  69:bsp/delay.c   ****         while (DWT_CYCCNT < end_ticks);
+ 172              		.loc 1 69 27 is_stmt 1 discriminator 1 view .LVU38
+ 173              		.loc 1 69 16 is_stmt 0 discriminator 1 view .LVU39
+ 174 0022 074B     		ldr	r3, .L17+4
+ 175 0024 5B68     		ldr	r3, [r3, #4]
+ 176              		.loc 1 69 27 discriminator 1 view .LVU40
+ 177 0026 8342     		cmp	r3, r0
+ 178 0028 FBD3     		bcc	.L13
+ 179              	.L9:
+  70:bsp/delay.c   ****     } else {
+  71:bsp/delay.c   ****         while (DWT_CYCCNT < end_ticks);
+  72:bsp/delay.c   ****     }
+  73:bsp/delay.c   **** }...
+ 180              		.loc 1 73 1 view .LVU41
+ 181 002a 10BD     		pop	{r4, pc}
+ 182              	.LVL9:
+ 183              	.L16:
+  57:bsp/delay.c   ****         delay_init();
+ 184              		.loc 1 57 9 is_stmt 1 view .LVU42
+ 185 002c FFF7FEFF 		bl	delay_init
+ 186              	.LVL10:
+  57:bsp/delay.c   ****         delay_init();
+ 187              		.loc 1 57 9 is_stmt 0 view .LVU43
+ 188 0030 EBE7     		b	.L10
+ 189              	.LVL11:
+ 190              	.L11:
+  71:bsp/delay.c   ****         while (DWT_CYCCNT < end_ticks);
+ 191              		.loc 1 71 27 is_stmt 1 discriminator 1 view .LVU44
+  71:bsp/delay.c   ****         while (DWT_CYCCNT < end_ticks);
+ 192              		.loc 1 71 16 is_stmt 0 discriminator 1 view .LVU45
+ 193 0032 034B     		ldr	r3, .L17+4
+ 194 0034 5B68     		ldr	r3, [r3, #4]
+  71:bsp/delay.c   ****         while (DWT_CYCCNT < end_ticks);
+ 195              		.loc 1 71 27 discriminator 1 view .LVU46
+ 196 0036 8342     		cmp	r3, r0
+ 197 0038 FBD3     		bcc	.L11
+ 198 003a F6E7     		b	.L9
+ 199              	.L18:
+ 200              		.align	2
+ 201              	.L17:
+ 202 003c 00000000 		.word	us_ticks
+ 203 0040 001000E0 		.word	-536866816
+ 204              		.cfi_endproc
+ 205              	.LFE67:
+ 207              		.section	.bss.us_ticks,"aw",%nobits
+ 208              		.align	2
+ 211              	us_ticks:
+ 212 0000 00000000 		.space	4
+ 213              		.text
+ 214              	.Letext0:
+ 215              		.file 2 "D:/BaiduNetdiskDownload/vscode_download/all_in_one/stm32tools/arm-none-eabi-gcc/14.2.1-1.
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s 			page 6
+
+
+ 216              		.file 3 "D:/BaiduNetdiskDownload/vscode_download/all_in_one/stm32tools/arm-none-eabi-gcc/14.2.1-1.
+ 217              		.file 4 "Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal.h"
+ 218              		.file 5 "Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rcc.h"
+ARM GAS  C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s 			page 7
+
+
+DEFINED SYMBOLS
+                            *ABS*:00000000 delay.c
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:19     .text.delay_init:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:25     .text.delay_init:00000000 delay_init
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:83     .text.delay_init:0000004c $d
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:211    .bss.us_ticks:00000000 us_ticks
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:90     .text.delay_ms:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:96     .text.delay_ms:00000000 delay_ms
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:117    .text.delay_us:00000000 $t
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:123    .text.delay_us:00000000 delay_us
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:202    .text.delay_us:0000003c $d
+C:\Users\LJH\AppData\Local\Temp\ccRTgzJ2.s:208    .bss.us_ticks:00000000 $d
+
+UNDEFINED SYMBOLS
+HAL_RCC_GetHCLKFreq
+HAL_Delay
